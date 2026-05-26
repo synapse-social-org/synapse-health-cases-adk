@@ -19,6 +19,13 @@ prompt into a multi-agent workflow:
 - `clinical_trial_agent` retrieves relevant ClinicalTrials.gov studies.
 - `researcher_match_agent` finds researchers, trialists, and centers through
   Synapse's researcher graph.
+- `web_discourse_agent` runs in parallel and is grounded with ADK's built-in
+  ``google_search`` tool (Gemini-native Google Search grounding). It pulls
+  real-time signals -- FDA/EMA announcements, late-breaking conference results,
+  guideline updates not yet in PubMed, and credible X/web discourse -- that
+  static literature retrieval would miss. If the running ADK version does not
+  expose ``google.adk.tools.google_search``, the agent is silently omitted and
+  the rest of the workflow proceeds unchanged.
 - `intervention_topics_agent` distills the parallel research outputs into a
   citation-grounded "Topics to Discuss With Your Specialist" block. It NEVER
   recommends treatments or doses; it phrases each bullet as a question or topic
@@ -43,9 +50,13 @@ flowchart TD
   Parallel --> Evidence["evidence_research_agent"]
   Parallel --> Trials["clinical_trial_agent"]
   Parallel --> Researchers["researcher_match_agent"]
+  Parallel --> WebDiscourse["web_discourse_agent
+  (google_search grounded)"]
   Evidence --> Tools["Synapse research tools"]
   Trials --> TrialDB["ClinicalTrial collection"]
   Researchers --> AuthorGraph["Researcher graph"]
+  WebDiscourse --> GoogleSearch["Google Search
+  grounding"]
   Parallel --> Topics["intervention_topics_agent"]
   Topics --> Synthesis["health_case_brief_synthesis_agent"]
   Synthesis --> Result["Expert Research brief"]

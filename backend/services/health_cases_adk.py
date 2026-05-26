@@ -5,15 +5,6 @@ running the competition path through a Google ADK multi-agent workflow when the
 ``google-adk`` package is available. The fallback remains the legacy research
 agent so production never fails closed because an optional agent runtime is
 missing in a lightweight environment.
-
-------------------------------------------------------------------------
-NOTE (public mirror): This file is extracted from the private Synapse
-monorepo as part of the Devpost AI Agents Challenge submission. It is
-NOT runnable standalone -- some imports below reference broader Synapse
-infrastructure (research agent executors, Mongo models, etc.). The file
-is the authoritative ADK integration; see the project README for a
-runnable hosted demo: https://synapsesocial.com/health-cases
-------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -23,8 +14,10 @@ import json
 import logging
 import os
 import secrets
+import sys
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 import sentry_sdk
@@ -101,6 +94,60 @@ def _import_adk_runtime():
         raise HealthCaseADKUnavailable(str(exc)) from exc
 
     return Agent, ParallelAgent, SequentialAgent, Runner, InMemorySessionService, types
+
+
+def _mcp_enabled() -> bool:
+    return os.environ.get("HEALTH_CASE_ENABLE_MCP", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _build_mcp_toolset():
+    """Spawn the Health Cases MCP server and return an ADK McpToolset."""
+
+    try:
+        from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StdioConnectionParams
+        from mcp import StdioServerParameters
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Health Cases MCP toolset unavailable: %s", exc)
+        return None
+
+    backend_dir = Path(__file__).resolve().parent.parent
+    try:
+        return McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command=sys.executable,
+                    args=["-m", "services.mcp.synapse_mcp_server"],
+                    cwd=str(backend_dir),
+                ),
+            ),
+            tool_filter=["clinical_trials_lookup"],
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Failed to configure Health Cases MCP toolset: %s", exc)
+        sentry_sdk.capture_exception(exc)
+        return None
+
+
+def _import_google_search_tool():
+    """Import the ADK built-in Google Search grounding tool.
+
+    Returned as a separate import so the absence of the tool (older ADK
+    versions, or environments where Google Search grounding is not enabled
+    on the API key) downgrades cleanly to "no web-discourse agent" rather
+    than failing the whole brief.
+    """
+
+    try:
+        from google.adk.tools import google_search
+
+        return google_search
+    except Exception:  # pragma: no cover - depends on optional package
+        return None
 
 
 def _run_async(coro, *, timeout_seconds: float | None = None):
@@ -481,23 +528,82 @@ def run_health_case_intake_adk(
     )
 
 
-def stream_health_case_brief_adk(
+@dataclass
+class HealthCaseBriefAgents:
+    root_agent: Any
+    web_discourse_agent: Any | None = None
+
+
+def build_health_case_brief_prompt(
+    intake_payload: dict[str, Any], *, extra_question: str = ""
+) -> str:
+    """Build the Expert Research brief prompt from a Health Case intake payload."""
+
+    payload = {
+        "primary_specialty": intake_payload.get("primary_specialty"),
+        "condition_terms": intake_payload.get("condition_terms") or [],
+        "profile": intake_payload.get("profile") or {},
+        "extra_question": extra_question,
+    }
+    return (
+        "Create a cardiology-first Expert Research brief for this user-reviewed "
+        "Health Case profile. This is research education, not diagnosis or medical "
+        "advice. Do not invent facts from the uploaded records.\n\n"
+        "Use tools for guidelines, clinical trials, latest papers, evidence graph "
+        "signals, knowledge graph context, editorials, expert commentary, and "
+        "X/web discourse. Label clinicians as relevant researchers, trialists, "
+        "or centers of expertise; do not claim they are the 'best doctors' by "
+        "care-quality outcomes.\n\n"
+        "Format the answer with EXACTLY these markdown section headings in this "
+        "order:\n"
+        "## 1. What Experts Are Saying\n"
+        "- Summarize the strongest expert/evidence signals from guidelines, "
+        "knowledge graph, evidence graph, editorials, conference discussion, "
+        "and X/web commentary. Call out whether a claim is guideline-backed, "
+        "trial-backed, editorial/commentary, or emerging.\n\n"
+        "## 2. Relevant Research Papers\n"
+        "- List the most relevant papers with title, first author when known, "
+        "year, why it matters for this case, and citation/source details. "
+        "End this section with a 'Create Feed' recommendation containing a "
+        "feed topic and search terms.\n\n"
+        "## 3. Relevant Researchers\n"
+        "- List relevant researchers or centers with their rationale, institution "
+        "when known, and what to ask them about. Include 'Request Contact' as "
+        "the user action for each researcher. Use Synapse profile identifiers "
+        "or links when available; otherwise state that the profile should be "
+        "matched before outreach.\n\n"
+        "## 4. Clinical Trials\n"
+        "- List relevant trials with NCT IDs when available, status, phase, "
+        "intervention, eligibility caveats, location notes if known, and why "
+        "the trial may or may not fit this case.\n\n"
+        "## 5. Topics to Discuss With Your Specialist\n"
+        "- Open the section with a one-sentence disclaimer that these are "
+        "research-grounded conversation topics, not medical advice. Then list "
+        "3-6 bullets, each phrased as a topic or question to raise (never as "
+        "an instruction), grounded in a specific paper title, NCT ID, or "
+        "researcher mentioned elsewhere in this brief. Avoid dosages, "
+        "specific drug doses, and 'you should' language; talk about classes "
+        "or themes. End each bullet with the relevant specialist in "
+        "parentheses, e.g. '(retina specialist)' or '(nephrology)'. If "
+        "fewer than three citation-grounded topics can be supported, write "
+        "only the disclaimer and explain that the brief did not surface "
+        "enough cited material for safe discussion topics.\n\n"
+        "## 6. Feedback\n"
+        "- Ask the user what was helpful, what is missing, and what context "
+        "would improve the next pass. Suggest 2-3 concrete follow-up questions "
+        "the system should ask.\n\n"
+        f"Health Case profile JSON:\n{json.dumps(payload, sort_keys=True)}"
+    )
+
+
+def build_health_case_brief_root_agent(
     *,
-    prompt: str,
-    user_id: str,
-    model: str = DEFAULT_MODEL,
-    timeout_seconds: float = DEFAULT_BRIEF_TIMEOUT_SECONDS,
-) -> Iterable[dict[str, Any]]:
-    """Run the Health Case Expert Research brief through an ADK team."""
+    model: str,
+    tools: list[Any],
+) -> HealthCaseBriefAgents:
+    """Construct the ADK multi-agent graph used for Health Case briefs."""
 
-    if not should_use_adk():
-        raise HealthCaseADKUnavailable("HEALTH_CASE_AGENT_BACKEND is not adk")
-
-    _ensure_google_api_key()
     Agent, ParallelAgent, SequentialAgent, *_ = _import_adk_runtime()
-
-    state = _ToolRunState()
-    tools = _build_health_case_tools(state)
 
     evidence_agent = Agent(
         model=model,
@@ -511,16 +617,21 @@ def stream_health_case_brief_adk(
         tools=tools,
         output_key="evidence_research",
     )
+    trial_tools = list(tools)
+    mcp_toolset = _build_mcp_toolset() if _mcp_enabled() else None
+    if mcp_toolset is not None:
+        trial_tools.append(mcp_toolset)
     trial_agent = Agent(
         model=model,
         name="clinical_trial_agent",
         description="Finds relevant ClinicalTrials.gov studies and caveats.",
         instruction=(
-            "Use clinical_trials_lookup to find relevant trials. Include NCT "
+            "Use clinical_trials_lookup to find relevant trials. When the MCP "
+            "tool is available, prefer it for trial retrieval. Include NCT "
             "IDs, phase/status, intervention, eligibility caveats, location "
             "notes when known, and why each trial may or may not fit."
         ),
-        tools=tools,
+        tools=trial_tools,
         output_key="clinical_trial_research",
     )
     researcher_agent = Agent(
@@ -536,10 +647,43 @@ def stream_health_case_brief_adk(
         tools=tools,
         output_key="researcher_research",
     )
+
+    parallel_subagents = [evidence_agent, trial_agent, researcher_agent]
+    google_search_tool = _import_google_search_tool()
+    web_discourse_agent = None
+    if google_search_tool is not None:
+        web_discourse_agent = Agent(
+            model=model,
+            name="web_discourse_agent",
+            description=(
+                "Grounds the Health Case in real-time public discourse via "
+                "Google Search (news, FDA/EMA, conference debriefs, X/web)."
+            ),
+            instruction=(
+                "Use Google Search to find recent (prefer last 12 months) "
+                "real-time signals relevant to the Health Case conditions: "
+                "regulatory announcements (FDA/EMA approvals, label changes, "
+                "safety alerts), late-breaking conference results (ACC, AHA, "
+                "ESC, ASN, ARVO, AAO, ASCO), guideline updates not yet in "
+                "PubMed, expert commentary, and public X/web discussion. "
+                "Skip generic patient-advocacy or low-quality sources. For "
+                "each item return: a one-line summary, the source URL, the "
+                "date if visible, and a short note on why it matters for "
+                "this case. Return at most 6 items. If Google Search returns "
+                "nothing trustworthy, return the literal string 'No reliable "
+                "real-time signals found.' rather than fabricating items."
+            ),
+            tools=[google_search_tool],
+            output_key="web_discourse_research",
+        )
+        parallel_subagents.append(web_discourse_agent)
     parallel_research = ParallelAgent(
         name="health_case_parallel_research",
-        sub_agents=[evidence_agent, trial_agent, researcher_agent],
-        description="Runs evidence, trial, and researcher research in parallel.",
+        sub_agents=parallel_subagents,
+        description=(
+            "Runs evidence, trial, researcher, and (when available) "
+            "Google-Search-grounded web discourse research in parallel."
+        ),
     )
     intervention_topics_agent = Agent(
         model=model,
@@ -556,6 +700,8 @@ def stream_health_case_brief_adk(
             "Evidence findings:\n{evidence_research}\n\n"
             "Clinical trial findings:\n{clinical_trial_research}\n\n"
             "Researcher findings:\n{researcher_research}\n\n"
+            "Web-discourse findings (Google Search grounded; may be empty):\n"
+            "{web_discourse_research?}\n\n"
             "OUTPUT FORMAT: A short disclaimer sentence followed by 3-6 "
             "markdown bullets. Every bullet MUST:\n"
             "  * be phrased as a TOPIC or QUESTION TO RAISE, never as an "
@@ -591,10 +737,18 @@ def stream_health_case_brief_adk(
             "Evidence findings:\n{evidence_research}\n\n"
             "Clinical trial findings:\n{clinical_trial_research}\n\n"
             "Researcher findings:\n{researcher_research}\n\n"
+            "Web-discourse findings (Google Search grounded; may be empty):\n"
+            "{web_discourse_research?}\n\n"
             "Topics to Discuss With Your Specialist (pre-synthesized "
             "verbatim block, drop directly under the matching section "
             "heading -- do NOT rewrite, re-cite, or expand it):\n"
             "{intervention_topics}\n\n"
+            "Section 1 ('What Experts Are Saying') should weave in any "
+            "real-time signals from the web-discourse findings (regulatory "
+            "announcements, late-breaking conference results, news) with a "
+            "URL and a clear 'real-time / news' qualifier, alongside the "
+            "guideline-backed and trial-backed claims. Do not invent a "
+            "real-time signal that is not in the web-discourse findings.\n\n"
             "Follow the requested section headings exactly, including "
             "section 5 'Topics to Discuss With Your Specialist'. This is "
             "education and research support only, not diagnosis or medical "
@@ -609,10 +763,50 @@ def stream_health_case_brief_adk(
             "citation-grounded discussion topics, then assemble the brief."
         ),
     )
+    return HealthCaseBriefAgents(
+        root_agent=root_agent,
+        web_discourse_agent=web_discourse_agent,
+    )
+
+
+def health_case_brief_agent_names(web_discourse_agent: Any | None) -> list[str]:
+    return [
+        name
+        for name in [
+            "health_case_navigator",
+            "health_case_parallel_research",
+            "evidence_research_agent",
+            "clinical_trial_agent",
+            "researcher_match_agent",
+            "web_discourse_agent" if web_discourse_agent is not None else None,
+            "intervention_topics_agent",
+            "health_case_brief_synthesis_agent",
+        ]
+        if name
+    ]
+
+
+def stream_health_case_brief_adk(
+    *,
+    prompt: str,
+    user_id: str,
+    model: str = DEFAULT_MODEL,
+    timeout_seconds: float = DEFAULT_BRIEF_TIMEOUT_SECONDS,
+) -> Iterable[dict[str, Any]]:
+    """Run the Health Case Expert Research brief through an ADK team."""
+
+    if not should_use_adk():
+        raise HealthCaseADKUnavailable("HEALTH_CASE_AGENT_BACKEND is not adk")
+
+    _ensure_google_api_key()
+
+    state = _ToolRunState()
+    tools = _build_health_case_tools(state)
+    brief_agents = build_health_case_brief_root_agent(model=model, tools=tools)
 
     text = _run_async(
         _run_agent_text(
-            root_agent,
+            brief_agents.root_agent,
             prompt,
             user_id=user_id,
             session_id=f"brief_{secrets.token_hex(8)}",
@@ -627,15 +821,7 @@ def stream_health_case_brief_adk(
         tool_events=state.tool_events,
         feed_suggestion_events=_feed_suggestions_from_prompt(prompt),
         papers_cited=state.papers_cited,
-        agent_names=[
-            "health_case_navigator",
-            "health_case_parallel_research",
-            "evidence_research_agent",
-            "clinical_trial_agent",
-            "researcher_match_agent",
-            "intervention_topics_agent",
-            "health_case_brief_synthesis_agent",
-        ],
+        agent_names=health_case_brief_agent_names(brief_agents.web_discourse_agent),
     )
 
     yield {

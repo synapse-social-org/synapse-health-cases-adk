@@ -35,20 +35,31 @@ production output captured on 2026-05-26.
 
 We needed four things that map cleanly onto ADK primitives:
 
-1. **Parallel fan-out** to multiple specialist research tools — ADK's
-   `ParallelAgent` runs `paper_search`, `researcher_match`,
-   `clinical_trials_lookup`, and `feed_suggestions` concurrently. p50 brief
-   generation latency dropped roughly **2×** compared with our prior sequential
-   single-model path.
+1. **Multi-Agent Orchestration** with ADK's `ParallelAgent` — runs
+   `paper_search`, `researcher_match`, `clinical_trials_lookup`, and
+   **Grounding with Google Search** (`web_discourse_agent`) concurrently.
+   p50 brief generation latency dropped roughly **2×** compared with our prior
+   sequential single-model path.
 2. **Sequential orchestration** of intake → research → topics → synthesis, with
    a dedicated Gemini agent for the citation-grounded "Topics to Discuss"
    step that the final synthesis agent drops in verbatim. ADK's
    `SequentialAgent` composes these in one declarative chain.
-3. **Custom Python tools** wrapped around our existing Synapse research
+3. **MCP-native tool consumption** — `clinical_trials_lookup` is exposed over
+   the Model Context Protocol via a stdio MCP server and consumed by ADK's
+   `McpToolset`, matching the challenge guide's Build-track requirement for
+   agents that securely connect to external tools over MCP.
+4. **Custom Python tools** wrapped around our existing Synapse research
    stack — every tool is a thin adapter over an executor we already ship in
    production, so the ADK rewrite was a one-day integration rather than a
    re-implementation.
-4. **Per-agent prompt isolation** — the "Topics to Discuss" agent has very
+5. **Structured Output** — the Topics agent returns a constrained markdown
+   block (disclaimer + citation-grounded bullets) that synthesis drops in
+   verbatim under section 5.
+6. **Agent Evaluation** — a curated 4-case golden brief eval set
+   (`backend/tests/health_cases/golden_briefs.yaml`) with an ADK-compatible
+   `.evalset.json` and `make adk-eval` scorecard runner for baseline
+   measurement.
+7. **Per-agent prompt isolation** — the "Topics to Discuss" agent has very
    different safety constraints from the research agents (no doses, no
    instructions, mandatory citation). Having it as its own ADK agent with
    its own prompt and output key lets us reason about that contract
@@ -90,7 +101,7 @@ examples/
 
 ## Technology stack
 
-- **Agent framework**: [Google ADK 2.1](https://adk.dev) — `SequentialAgent`, `ParallelAgent`, custom `Tool`s
+- **Agent framework**: [Google Agent Development Kit (ADK) 2.1](https://adk.dev) — `SequentialAgent`, `ParallelAgent`, MCP `McpToolset`, Grounding with Google Search, custom `Tool`s
 - **LLM**: Google Gemini (via `google-genai >= 1.72`)
 - **Prompt iteration**: Google AI Studio
 - **API**: Python 3.11, Flask, Server-Sent Events (SSE)

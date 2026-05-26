@@ -7,13 +7,16 @@ graph LR
   Research --> T1[paper_search tool]
   Research --> T2[researcher_match tool]
   Research --> T3[clinical_trials_lookup tool]
-  Research --> T4[feed_suggestions tool]
+  Research --> MCP[MCP clinical_trials_lookup<br/>stdio server]
+  Research --> Web[web_discourse_agent<br/>Google Search grounding]
   ADK --> Topics[Topics to Discuss<br/>Agent / Gemini<br/>citation-grounded]
   Topics --> Synth[Synthesis Agent<br/>Gemini]
   T1 --> OA[(OpenAlex)]
   T2 --> NPI[(NPI Registry)]
   T2 --> Mongo[(Synapse Mongo)]
   T3 --> CT[(ClinicalTrials.gov v2)]
+  MCP --> CT
+  Web --> GoogleSearch[(Google Search)]
   Synth --> API
   API -.timeout / error fallback.-> Legacy[Legacy single-model research agent]
   classDef gcp fill:#4285F4,stroke:#1a73e8,color:white
@@ -21,8 +24,8 @@ graph LR
   classDef ext fill:#fbbc04,stroke:#f9ab00,color:#333
   classDef api fill:#EA4335,stroke:#c5221f,color:white
   classDef fallback fill:#9aa0a6,stroke:#5f6368,color:white
-  class ADK,Intake,Research,Synth,Topics gcp
-  class T1,T2,T3,T4 tool
-  class OA,NPI,Mongo,CT ext
+  class ADK,Intake,Research,Synth,Topics,Web gcp
+  class T1,T2,T3,MCP tool
+  class OA,NPI,Mongo,CT,GoogleSearch ext
   class API api
   class Legacy fallback
