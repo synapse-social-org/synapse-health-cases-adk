@@ -18,7 +18,16 @@ export interface ParsedBrief {
   preamble: BriefBlock[];
 }
 
-const SECTION_HEADERS: Array<{ id: string; heading: string; title: string }> = [
+interface SectionHeader {
+  id: string;
+  heading: string;
+  title: string;
+  // Legacy heading strings to fall back to when older briefs are loaded
+  // (e.g. briefs saved before the Topics section bumped Feedback from 5 to 6).
+  legacyHeadings?: readonly string[];
+}
+
+const SECTION_HEADERS: SectionHeader[] = [
   {
     id: 'experts',
     heading: '## 1. What Experts Are Saying',
@@ -35,7 +44,17 @@ const SECTION_HEADERS: Array<{ id: string; heading: string; title: string }> = [
     title: '3. Relevant Researchers',
   },
   { id: 'trials', heading: '## 4. Clinical Trials', title: '4. Clinical Trials' },
-  { id: 'feedback', heading: '## 5. Feedback', title: '5. Feedback' },
+  {
+    id: 'topics',
+    heading: '## 5. Topics to Discuss With Your Specialist',
+    title: '5. Topics to Discuss With Your Specialist',
+  },
+  {
+    id: 'feedback',
+    heading: '## 6. Feedback',
+    title: '6. Feedback',
+    legacyHeadings: ['## 5. Feedback'],
+  },
 ];
 
 function stripInlineMarkdown(text: string): string {
@@ -109,10 +128,23 @@ export function parseBrief(content: string): ParsedBrief {
   const result: ParsedBrief = { sections: [], preamble: [] };
 
   // Find each section's start; sections appear in order of SECTION_HEADERS.
-  const indices = SECTION_HEADERS.map((header) => ({
-    ...header,
-    start: normalized.indexOf(header.heading),
-  })).filter((entry) => entry.start !== -1);
+  // For each header, try the canonical heading first, then any legacy
+  // headings (used to keep rendering briefs saved before a section was
+  // renumbered or renamed).
+  const indices = SECTION_HEADERS.map((header) => {
+    const candidates = [header.heading, ...(header.legacyHeadings ?? [])];
+    let matchedHeading = header.heading;
+    let start = -1;
+    for (const candidate of candidates) {
+      const found = normalized.indexOf(candidate);
+      if (found !== -1) {
+        matchedHeading = candidate;
+        start = found;
+        break;
+      }
+    }
+    return { ...header, heading: matchedHeading, start };
+  }).filter((entry) => entry.start !== -1);
 
   if (indices.length === 0) {
     // No structured headings — render everything as a single Brief section so

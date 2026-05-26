@@ -149,21 +149,40 @@ const briefSections = [
     description: 'Relevant trials, status, eligibility caveats, and NCT IDs when available.',
   },
   {
+    id: 'topics',
+    heading: '## 5. Topics to Discuss With Your Specialist',
+    title: 'Topics to Discuss With Your Specialist',
+    description:
+      'Citation-grounded conversation topics to raise with your clinical team. Not medical advice.',
+  },
+  {
     id: 'feedback',
-    heading: '## 5. Feedback',
+    heading: '## 6. Feedback',
+    // Legacy briefs (saved before the Topics section was added) used "## 5.
+    // Feedback". Fall back to that so previously-generated briefs still render
+    // their Feedback content.
+    legacyHeadings: ['## 5. Feedback'],
     title: 'Feedback',
     description: 'Refine the brief, add missing context, or flag anything that looks off.',
     cta: 'Give Feedback',
   },
 ];
 
-function getBriefSectionContent(markdown: string, heading: string): string {
-  const start = markdown.indexOf(heading);
-  if (start === -1) return '';
-  const afterHeading = start + heading.length;
-  const nextHeading = markdown.slice(afterHeading).search(/\n##\s+\d+\./);
-  const end = nextHeading === -1 ? markdown.length : afterHeading + nextHeading;
-  return markdown.slice(afterHeading, end).trim();
+function getBriefSectionContent(
+  markdown: string,
+  heading: string,
+  legacyHeadings: readonly string[] = []
+): string {
+  const candidates = [heading, ...legacyHeadings];
+  for (const candidate of candidates) {
+    const start = markdown.indexOf(candidate);
+    if (start === -1) continue;
+    const afterHeading = start + candidate.length;
+    const nextHeading = markdown.slice(afterHeading).search(/\n##\s+\d+\./);
+    const end = nextHeading === -1 ? markdown.length : afterHeading + nextHeading;
+    return markdown.slice(afterHeading, end).trim();
+  }
+  return '';
 }
 
 function getInitials(name: string): string {
@@ -547,7 +566,11 @@ function ExpertResearchBrief({
   clinicalTrials?: HealthCaseClinicalTrial[];
   feedSuggestions?: HealthCaseFeedSuggestion[];
 }) {
-  const hasStructuredSections = briefSections.some((section) => content.includes(section.heading));
+  const hasStructuredSections = briefSections.some(
+    (section) =>
+      content.includes(section.heading) ||
+      (section.legacyHeadings ?? []).some((legacy) => content.includes(legacy))
+  );
 
   if (!hasStructuredSections) {
     return (
@@ -563,7 +586,11 @@ function ExpertResearchBrief({
   return (
     <div className="mt-2 grid gap-4">
       {briefSections.map((section) => {
-        const sectionContent = getBriefSectionContent(content, section.heading);
+        const sectionContent = getBriefSectionContent(
+          content,
+          section.heading,
+          section.legacyHeadings
+        );
         return (
           <section
             key={section.id}

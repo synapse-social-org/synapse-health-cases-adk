@@ -18,6 +18,10 @@ structured **Expert Research brief** containing:
 - Relevant published papers (with citations)
 - Named researchers worth consulting, with affiliations
 - Ongoing and recruiting clinical trials
+- **Citation-grounded conversation topics to discuss with the patient's
+  specialist** — every bullet must cite a paper/trial/researcher already in
+  the brief, never recommends specific doses, and falls back to a disclaimer
+  if the agent cannot ground at least three topics safely
 - A personalized literature feed
 
 …all grounded in real sources, streamed token-by-token to the browser, and
@@ -29,20 +33,26 @@ production output captured on 2026-05-26.
 
 ## Why Google ADK
 
-We needed three things that map cleanly onto ADK primitives:
+We needed four things that map cleanly onto ADK primitives:
 
 1. **Parallel fan-out** to multiple specialist research tools — ADK's
    `ParallelAgent` runs `paper_search`, `researcher_match`,
    `clinical_trials_lookup`, and `feed_suggestions` concurrently. p50 brief
    generation latency dropped roughly **2×** compared with our prior sequential
    single-model path.
-2. **Sequential orchestration** of intake → research → synthesis, with a final
-   Gemini synthesis agent composing the brief from all tool outputs. ADK's
-   `SequentialAgent` handles this with one declarative composition.
+2. **Sequential orchestration** of intake → research → topics → synthesis, with
+   a dedicated Gemini agent for the citation-grounded "Topics to Discuss"
+   step that the final synthesis agent drops in verbatim. ADK's
+   `SequentialAgent` composes these in one declarative chain.
 3. **Custom Python tools** wrapped around our existing Synapse research
    stack — every tool is a thin adapter over an executor we already ship in
    production, so the ADK rewrite was a one-day integration rather than a
    re-implementation.
+4. **Per-agent prompt isolation** — the "Topics to Discuss" agent has very
+   different safety constraints from the research agents (no doses, no
+   instructions, mandatory citation). Having it as its own ADK agent with
+   its own prompt and output key lets us reason about that contract
+   independently from the broader research and synthesis prompts.
 
 A legacy single-model research agent stays wired up as an **automatic fallback**
 inside the Flask route (`backend/api/routes/health_case/__init__.py`). If ADK

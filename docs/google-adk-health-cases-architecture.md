@@ -19,8 +19,15 @@ prompt into a multi-agent workflow:
 - `clinical_trial_agent` retrieves relevant ClinicalTrials.gov studies.
 - `researcher_match_agent` finds researchers, trialists, and centers through
   Synapse's researcher graph.
+- `intervention_topics_agent` distills the parallel research outputs into a
+  citation-grounded "Topics to Discuss With Your Specialist" block. It NEVER
+  recommends treatments or doses; it phrases each bullet as a question or topic
+  to raise, must cite a paper/NCT ID/researcher already in the inputs, and is
+  prompted with a hard rule to fall back to a disclaimer-only output if it
+  cannot ground three topics safely.
 - `health_case_brief_synthesis_agent` produces the final user-facing brief with
-  the same section contract the web UI already renders.
+  the same section contract the web UI already renders, dropping the topics
+  block verbatim under section 5 to avoid re-summarization drift.
 
 ## Runtime Flow
 
@@ -39,7 +46,8 @@ flowchart TD
   Evidence --> Tools["Synapse research tools"]
   Trials --> TrialDB["ClinicalTrial collection"]
   Researchers --> AuthorGraph["Researcher graph"]
-  Parallel --> Synthesis["health_case_brief_synthesis_agent"]
+  Parallel --> Topics["intervention_topics_agent"]
+  Topics --> Synthesis["health_case_brief_synthesis_agent"]
   Synthesis --> Result["Expert Research brief"]
   Result --> Cards["Researcher, trial, paper, and feed cards"]
 ```

@@ -541,26 +541,72 @@ def stream_health_case_brief_adk(
         sub_agents=[evidence_agent, trial_agent, researcher_agent],
         description="Runs evidence, trial, and researcher research in parallel.",
     )
+    intervention_topics_agent = Agent(
+        model=model,
+        name="intervention_topics_agent",
+        description=(
+            "Extracts citation-grounded conversation topics a patient can "
+            "raise with their specialist from the parallel research findings."
+        ),
+        instruction=(
+            "You produce 'Topics to Discuss With Your Specialist' for a "
+            "patient-facing research brief. You are NOT a clinician and NOT a "
+            "treatment recommender.\n\n"
+            "Inputs (already produced by upstream agents in this run):\n"
+            "Evidence findings:\n{evidence_research}\n\n"
+            "Clinical trial findings:\n{clinical_trial_research}\n\n"
+            "Researcher findings:\n{researcher_research}\n\n"
+            "OUTPUT FORMAT: A short disclaimer sentence followed by 3-6 "
+            "markdown bullets. Every bullet MUST:\n"
+            "  * be phrased as a TOPIC or QUESTION TO RAISE, never as an "
+            "    instruction (good: 'Ask your retina specialist about anti-VEGF "
+            "    evidence for MacTel...'; bad: 'Take anti-VEGF therapy.').\n"
+            "  * cite a specific paper title, NCT ID, or named researcher "
+            "    that already appears in the inputs above. If you cannot "
+            "    cite, drop the bullet.\n"
+            "  * avoid dosages, brand-name + dose combinations, and 'you "
+            "    should' language. Talk about classes, themes, or evidence "
+            "    questions.\n"
+            "  * end with the relevant specialist in parentheses, e.g. "
+            "    '(retina specialist)' or '(nephrology)'.\n\n"
+            "Always begin with this exact disclaimer paragraph (no heading, "
+            "no markdown emphasis), then a blank line, then the bullets:\n"
+            "These are research-grounded conversation topics to raise with "
+            "your clinical team, not medical advice. Each item links to a "
+            "paper, trial, or researcher already surfaced in this brief.\n\n"
+            "If you cannot find at least three citation-grounded topics, "
+            "output only the disclaimer followed by one bullet that says: "
+            "'- The brief did not surface enough cited material to suggest "
+            "specific discussion topics safely.'"
+        ),
+        output_key="intervention_topics",
+    )
     synthesis_agent = Agent(
         model=model,
         name="health_case_brief_synthesis_agent",
         description="Synthesizes the final Health Case Expert Research brief.",
         instruction=(
             "Create the final user-facing Expert Research brief using the "
-            "original Health Case prompt plus the parallel agent findings.\n\n"
+            "original Health Case prompt plus the agent findings.\n\n"
             "Evidence findings:\n{evidence_research}\n\n"
             "Clinical trial findings:\n{clinical_trial_research}\n\n"
             "Researcher findings:\n{researcher_research}\n\n"
-            "Follow the requested section headings exactly. This is education "
-            "and research support only, not diagnosis or medical advice."
+            "Topics to Discuss With Your Specialist (pre-synthesized "
+            "verbatim block, drop directly under the matching section "
+            "heading -- do NOT rewrite, re-cite, or expand it):\n"
+            "{intervention_topics}\n\n"
+            "Follow the requested section headings exactly, including "
+            "section 5 'Topics to Discuss With Your Specialist'. This is "
+            "education and research support only, not diagnosis or medical "
+            "advice."
         ),
     )
     root_agent = SequentialAgent(
         name="health_case_navigator",
-        sub_agents=[parallel_research, synthesis_agent],
+        sub_agents=[parallel_research, intervention_topics_agent, synthesis_agent],
         description=(
-            "ADK Health Case Navigator that researches evidence, trials, and "
-            "researchers before synthesizing a cited brief."
+            "ADK Health Case Navigator: research in parallel, then synthesize "
+            "citation-grounded discussion topics, then assemble the brief."
         ),
     )
 
@@ -587,6 +633,7 @@ def stream_health_case_brief_adk(
             "evidence_research_agent",
             "clinical_trial_agent",
             "researcher_match_agent",
+            "intervention_topics_agent",
             "health_case_brief_synthesis_agent",
         ],
     )
