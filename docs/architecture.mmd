@@ -1,0 +1,27 @@
+graph LR
+  U[User<br/>Next.js Health Cases UI] -->|POST /health-cases| API[Flask API on AWS ECS]
+  API -->|SSE stream| U
+  API -->|Runner.run_async| ADK[Google ADK Orchestrator]
+  ADK --> Intake[Intake Agent<br/>Gemini]
+  ADK --> Research[ParallelAgent<br/>Research stage]
+  Research --> T1[paper_search tool]
+  Research --> T2[researcher_match tool]
+  Research --> T3[clinical_trials_lookup tool]
+  Research --> T4[feed_suggestions tool]
+  ADK --> Synth[Synthesis Agent<br/>Gemini]
+  T1 --> OA[(OpenAlex)]
+  T2 --> NPI[(NPI Registry)]
+  T2 --> Mongo[(Synapse Mongo)]
+  T3 --> CT[(ClinicalTrials.gov v2)]
+  Synth --> API
+  API -.timeout / error fallback.-> Legacy[Legacy single-model research agent]
+  classDef gcp fill:#4285F4,stroke:#1a73e8,color:white
+  classDef tool fill:#34A853,stroke:#0f9d58,color:white
+  classDef ext fill:#fbbc04,stroke:#f9ab00,color:#333
+  classDef api fill:#EA4335,stroke:#c5221f,color:white
+  classDef fallback fill:#9aa0a6,stroke:#5f6368,color:white
+  class ADK,Intake,Research,Synth gcp
+  class T1,T2,T3,T4 tool
+  class OA,NPI,Mongo,CT ext
+  class API api
+  class Legacy fallback
