@@ -5,16 +5,21 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { BorderBeam } from 'border-beam';
-import { motion, useReducedMotion } from 'framer-motion';
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { useQueryState } from 'nuqs';
 import z from 'zod';
 import AnimatedDots from '@/app/components/AnimatedDots';
 import Button from '@/app/components/Button';
-import LoadingSpinner from '@/app/components/LoadingSpinner';
+import PageSkeleton from '@/app/components/PageSkeleton';
+import SplashLogoOrb from '@/app/components/SplashLogoOrb';
 import SynapseIcon from '@/app/components/icons/SynapseIcon';
+import { BookIcon, NetworkIcon, QuoteIcon, SparkleIcon } from '@/app/components/icons';
+import { useShellChrome } from '@/app/components/ShellChromeContext';
+import { usePaper } from '@synapse/lib/client';
 import { feedPhraseToId, UserDataSchema } from '@synapse/lib';
 import {
   HealthCase,
+  HealthCaseCitationGrounding,
   HealthCaseClinicalTrial,
   HealthCaseFeedSuggestion,
   HealthCaseIntake,
@@ -27,10 +32,12 @@ import {
   useHealthCaseIntake,
   useHealthCases,
   useRequestHealthCaseResearcherContact,
+  useUpdateHealthCaseDigest,
   useUpdateHealthCaseProfile,
   useUploadHealthCaseDocument,
 } from '@/app/hooks/useHealthCases';
 import { parseBrief, safeFilename } from './briefPdf';
+import { BriefFinishedActions, briefHasStructuredSections } from './BriefFinishedActions';
 import { MarkdownContent } from '@/app/components/markdown/MarkdownContent';
 import { authFetch } from '@/lib/authUtils';
 import { safeHref } from '@/lib/safeHref';
@@ -553,18 +560,179 @@ function ClinicalTrialCards({ trials }: { trials?: HealthCaseClinicalTrial[] }) 
   );
 }
 
+function BriefCitedPaperThumbnail({
+  paperId,
+  fallbackTitle,
+  onResolve,
+}: {
+  paperId: string;
+  fallbackTitle?: string;
+  onResolve: (id: string, hasAbstract: boolean) => void;
+}) {
+  const { data: paper } = usePaper(paperId);
+  const url =
+    paper && 'graphical_abstract_url' in paper
+      ? ((paper as { graphical_abstract_url?: string }).graphical_abstract_url ?? undefined)
+      : undefined;
+  const title =
+    (paper && 'title' in paper ? (paper as { title?: string }).title : undefined) ||
+    fallbackTitle ||
+    'Cited paper';
+
+  useEffect(() => {
+    if (paper) onResolve(paperId, Boolean(url));
+  }, [paper, url, paperId, onResolve]);
+
+  if (!url) return null;
+
+  return (
+    <Link href={`/papers/${paperId}`} className="group block w-[150px] shrink-0" title={title}>
+      <div className="overflow-hidden rounded-2xl border border-neutral-200 bg-white transition group-hover:border-sky-300 dark:border-neutral-800 dark:bg-neutral-900 dark:group-hover:border-sky-900">
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={url}
+          alt={`Graphical abstract: ${title}`}
+          loading="lazy"
+          className="h-[110px] w-full object-cover"
+        />
+      </div>
+      <p className="mt-1.5 line-clamp-2 text-xs leading-4 text-neutral-600 dark:text-neutral-300">
+        {title}
+      </p>
+    </Link>
+  );
+}
+
+/**
+ * Renders graphical-abstract thumbnails for the brief's cited papers. Cited
+ * papers (`brief.sources` / `papers_cited`) only carry `{ title, id }`, so each
+ * thumbnail fetches the paper via `usePaper` to obtain `graphical_abstract_url`.
+ * Papers without an id (e.g. web-search citations) or without an abstract are
+ * skipped; the section disappears entirely when none qualify.
+ */
+function BriefCitedPapers({ sources }: { sources?: Array<Record<string, unknown>> }) {
+  const cited = useMemo(() => {
+    const seen = new Set<string>();
+    const out: Array<{ id: string; title?: string }> = [];
+    for (const source of sources || []) {
+      const id = typeof source.id === 'string' ? source.id : undefined;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, title: typeof source.title === 'string' ? source.title : undefined });
+    }
+    return out.slice(0, 8);
+  }, [sources]);
+
+  const [abstractById, setAbstractById] = useState<Record<string, boolean>>({});
+  const handleResolve = useCallback((id: string, hasAbstract: boolean) => {
+    setAbstractById((prev) => (prev[id] === hasAbstract ? prev : { ...prev, [id]: hasAbstract }));
+  }, []);
+  const anyAbstract = Object.values(abstractById).some(Boolean);
+
+  if (cited.length === 0) return null;
+
+  return (
+    <div className={anyAbstract ? 'mt-4' : ''}>
+      {anyAbstract && (
+        <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
+          Visual abstracts
+        </p>
+      )}
+      <div className={anyAbstract ? 'mt-2 flex gap-3 overflow-x-auto pb-1' : 'flex'}>
+        {cited.map((paper) => (
+          <BriefCitedPaperThumbnail
+            key={paper.id}
+            paperId={paper.id}
+            fallbackTitle={paper.title}
+            onResolve={handleResolve}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Active shimmer placeholder shown while a brief streams in but has no text yet. */
+function BriefGeneratingPlaceholder() {
+  const reduceMotion = useReducedMotion();
+  return (
+    <div className="mt-3">
+      <p className="text-sm text-neutral-500">
+        Synapse is reading evidence, talking to its tools, and pulling citations. This usually takes
+        ~30s
+        <AnimatedDots />
+      </p>
+      <div className="mt-4 space-y-3">
+        {Array.from({ length: 3 }).map((_, index) => (
+          <motion.div
+            key={index}
+            className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800"
+            animate={reduceMotion ? undefined : { opacity: [0.5, 1, 0.5] }}
+            transition={{
+              duration: 1.6,
+              repeat: Infinity,
+              ease: 'easeInOut',
+              delay: reduceMotion ? 0 : index * 0.2,
+            }}
+          >
+            <div className="h-3 w-24 rounded-full bg-sky-100 dark:bg-sky-950/40" />
+            <div className="mt-3 h-3 w-11/12 rounded-full bg-neutral-200 dark:bg-neutral-800" />
+            <div className="mt-2 h-3 w-3/4 rounded-full bg-neutral-200 dark:bg-neutral-800" />
+          </motion.div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Surfaces the post-generation hallucination guard. When the agent's prose
+ * references trial NCT IDs or acronyms that could not be matched against the
+ * retrieved evidence, we flag them here rather than silently trusting the
+ * text — honest "we could not verify these" beats false confidence.
+ */
+function UnverifiedReferencesNotice({
+  grounding,
+}: {
+  grounding?: HealthCaseCitationGrounding | null;
+}) {
+  const ncts = grounding?.unverified_ncts ?? [];
+  const acronyms = grounding?.unverified_acronyms ?? [];
+  if (ncts.length === 0 && acronyms.length === 0) return null;
+
+  const items = [...ncts, ...acronyms];
+  return (
+    <div
+      role="note"
+      aria-label="Unverified references"
+      className="mt-2 rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200"
+    >
+      <p className="font-semibold">References we could not verify</p>
+      <p className="mt-1 leading-6">
+        These trials or studies are mentioned in the brief but did not match a source we retrieved.
+        Confirm them against the primary source before relying on them:{' '}
+        <span className="font-medium">{items.join(', ')}</span>.
+      </p>
+    </div>
+  );
+}
+
 function ExpertResearchBrief({
   caseId,
   content,
   researchers,
   clinicalTrials,
   feedSuggestions,
+  sources,
+  citationGrounding,
 }: {
   caseId: string;
   content: string;
   researchers?: HealthCaseResearcher[];
   clinicalTrials?: HealthCaseClinicalTrial[];
   feedSuggestions?: HealthCaseFeedSuggestion[];
+  sources?: Array<Record<string, unknown>>;
+  citationGrounding?: HealthCaseCitationGrounding | null;
 }) {
   const hasStructuredSections = briefSections.some(
     (section) =>
@@ -629,7 +797,11 @@ function ExpertResearchBrief({
                 </p>
               )}
               {section.id === 'papers' && (
-                <StructuredFeedSuggestions suggestions={feedSuggestions} />
+                <>
+                  <BriefCitedPapers sources={sources} />
+                  <UnverifiedReferencesNotice grounding={citationGrounding} />
+                  <StructuredFeedSuggestions suggestions={feedSuggestions} />
+                </>
               )}
               {section.id === 'researchers' && (
                 <ResearcherCards key={caseId} caseId={caseId} researchers={researchers} />
@@ -738,7 +910,7 @@ function ChatComposer({
               }
             }}
             placeholder={placeholder}
-            className="min-h-16 flex-1 resize-none rounded-2xl border-0 bg-transparent px-3 py-3 text-sm text-neutral-900 outline-none placeholder:text-neutral-400 dark:text-white"
+            className="min-h-16 flex-1 cursor-text resize-none rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-900 outline-none transition placeholder:text-neutral-400 focus:border-sky-400 focus:bg-white focus:ring-2 focus:ring-sky-100 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white dark:placeholder:text-neutral-500 dark:focus:border-sky-500 dark:focus:ring-sky-950"
             data-posthog-mask
             aria-label="Message"
           />
@@ -806,7 +978,7 @@ function CreateCaseCard() {
   const [intake, setIntake] = useState<HealthCaseIntake | null>(null);
   const [uploadProgress, setUploadProgress] = useState('');
   const [actionError, setActionError] = useState('');
-  const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   const isSubmitting = intakeCase.isPending || createCase.isPending || uploadDocuments.isPending;
 
   const userStory = messages
@@ -826,8 +998,13 @@ function CreateCaseCard() {
     );
   };
 
+  // Keep the latest turn visible by scrolling only the chat container — never
+  // the window. `scrollIntoView` bubbles to every scrollable ancestor and was
+  // yanking the whole page back to the top on each send.
   useEffect(() => {
-    endOfMessagesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
   }, [messages.length, intakeCase.isPending]);
 
   const submitTurn = async () => {
@@ -971,7 +1148,10 @@ function CreateCaseCard() {
         </div>
 
         <div className="relative space-y-5 p-4 md:p-6 lg:p-8">
-          <div className="max-h-[520px] min-h-[280px] space-y-5 overflow-y-auto rounded-[30px] border border-white/70 bg-white/45 p-4 pr-2 shadow-inner dark:border-white/[0.06] dark:bg-black/10 md:p-6">
+          <div
+            ref={messagesContainerRef}
+            className="max-h-[520px] min-h-[150px] space-y-5 overflow-y-auto rounded-[30px] border border-white/70 bg-white/45 p-4 pr-2 shadow-inner dark:border-white/[0.06] dark:bg-black/10 md:p-6"
+          >
             {messages.map((message) => (
               <ChatBubble
                 key={message.id}
@@ -1019,7 +1199,6 @@ function CreateCaseCard() {
                 </div>
               </ChatBubble>
             )}
-            <div ref={endOfMessagesRef} />
           </div>
 
           <ChatComposer
@@ -1056,6 +1235,10 @@ function CreateCaseCard() {
             </p>
           )}
           {uploadProgress && <p className="text-xs text-neutral-500">{uploadProgress}</p>}
+          <p className="text-xs leading-5 text-neutral-500 dark:text-neutral-400">
+            Educational research only — not a diagnosis or medical advice. Records are encrypted and
+            only used for your case.
+          </p>
         </div>
       </motion.section>
     </BorderBeam>
@@ -1133,33 +1316,247 @@ function ChatTypingBubble({ label }: { label: string }) {
   );
 }
 
+function ChevronRightGlyph({ className = '' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden>
+      <path
+        d="M7.5 5l5 5-5 5"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+/**
+ * Makes a Health Cases surface immersive: collapses the global desktop sidebar
+ * on mount and restores it on unmount, so other routes are untouched. Called at
+ * the top of a page component (before any early returns) to avoid a flash of
+ * the expanded sidebar while data loads.
+ */
+function useImmersiveSidebar() {
+  const { setSidebarCollapsed } = useShellChrome();
+  useEffect(() => {
+    setSidebarCollapsed(true);
+    return () => setSidebarCollapsed(false);
+  }, [setSidebarCollapsed]);
+}
+
+/** Left-edge handle that brings the collapsed sidebar back (desktop only). */
+function SidebarRestoreHandle() {
+  const { sidebarCollapsed, setSidebarCollapsed } = useShellChrome();
+  const reduceMotion = useReducedMotion();
+  return (
+    <AnimatePresence>
+      {sidebarCollapsed && (
+        <motion.button
+          type="button"
+          onClick={() => setSidebarCollapsed(false)}
+          aria-label="Show navigation sidebar"
+          className="synapse-glass-strong fixed left-0 top-1/2 z-40 hidden -translate-y-1/2 items-center gap-1.5 rounded-r-2xl border border-l-0 border-black/5 py-3 pl-2 pr-2.5 text-neutral-600 shadow-md transition-colors hover:text-neutral-950 md:flex dark:border-white/10 dark:text-neutral-300 dark:hover:text-white"
+          initial={reduceMotion ? false : { x: -24, opacity: 0 }}
+          animate={{ x: 0, opacity: 1 }}
+          exit={reduceMotion ? { opacity: 0 } : { x: -24, opacity: 0 }}
+          transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+        >
+          <SynapseIcon className="h-5 w-5" isFilled />
+          <ChevronRightGlyph className="h-4 w-4" />
+        </motion.button>
+      )}
+    </AnimatePresence>
+  );
+}
+
+const HEALTH_CASE_VALUE_ITEMS: Array<{
+  icon: React.ComponentType<{ className?: string; isFilled?: boolean }>;
+  title: string;
+  description: string;
+}> = [
+  {
+    icon: QuoteIcon,
+    title: 'What experts are saying',
+    description: 'Synthesized consensus from guidelines, editorials, and clinician discourse.',
+  },
+  {
+    icon: NetworkIcon,
+    title: 'Who is working on it',
+    description: 'Relevant researchers and centers, with the rationale for each match.',
+  },
+  {
+    icon: SparkleIcon,
+    title: 'Clinical trials',
+    description: 'Active trials that fit the case, with phase, status, and why they fit.',
+  },
+  {
+    icon: BookIcon,
+    title: 'The latest papers',
+    description: 'Recent research surfaced and summarized — every claim cited.',
+  },
+];
+
+function HealthCaseValueStrip() {
+  const reduceMotion = useReducedMotion();
+  return (
+    <section aria-label="What Synapse brings back" className="w-full">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {HEALTH_CASE_VALUE_ITEMS.map((item, index) => {
+          const Icon = item.icon;
+          return (
+            <motion.div
+              key={item.title}
+              className="synapse-card flex h-full flex-col gap-3 rounded-3xl p-5"
+              initial={reduceMotion ? false : { opacity: 0, y: 16 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: '-60px' }}
+              transition={{ duration: 0.4, delay: reduceMotion ? 0 : index * 0.07 }}
+            >
+              <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--accent-light)] text-[var(--accent)]">
+                <Icon className="h-5 w-5" />
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-neutral-950 dark:text-white">
+                  {item.title}
+                </p>
+                <p className="mt-1 text-sm leading-6 text-neutral-500 dark:text-neutral-400">
+                  {item.description}
+                </p>
+              </div>
+            </motion.div>
+          );
+        })}
+      </div>
+      <p className="mx-auto mt-4 max-w-3xl text-center text-xs leading-6 text-neutral-500 dark:text-neutral-400">
+        Behind the scenes, a multi-agent research team splits evidence, trial, and researcher
+        discovery before synthesizing the brief. While we&rsquo;re in beta we focus on cardiology
+        cases.
+      </p>
+    </section>
+  );
+}
+
+const HEALTH_CASE_GROUNDING_POINTS: Array<{ title: string; description: string }> = [
+  {
+    title: 'Grounded in real evidence',
+    description:
+      'A multi-agent research team queries 600,000+ peer-reviewed cardiology papers, ACC/AHA/ESC guidelines, and ClinicalTrials.gov in real time. The model is instructed to use tools, not answer from memory.',
+  },
+  {
+    title: 'Every claim cited',
+    description:
+      'Each clinical or quantitative statement is tied to a specific paper, trial (NCT ID), or guideline — and the cited sources are shown right alongside the brief.',
+  },
+  {
+    title: 'Automatic citation checks',
+    description:
+      "After drafting, we verify referenced trials and studies against our databases and flag any reference we can't confirm, instead of presenting it as fact.",
+  },
+  {
+    title: 'Built from your case',
+    description:
+      'Briefs are generated from the profile you review and confirm plus your uploaded records, which stay encrypted and are used only for your case.',
+  },
+];
+
+/**
+ * Public-facing explainer for how Health Cases minimizes hallucination and
+ * keeps outputs cited. Copy is intentionally constrained to what the pipeline
+ * actually does (tool-grounded retrieval, inline citations, post-hoc citation
+ * verification) so marketing stays truthful to the implementation.
+ */
+function HealthCaseGroundingSection() {
+  const reduceMotion = useReducedMotion();
+  return (
+    <motion.section
+      aria-label="How we keep it grounded and cited"
+      className="synapse-card rounded-[28px] p-6 md:p-8"
+      initial={reduceMotion ? false : { opacity: 0, y: 16 }}
+      whileInView={{ opacity: 1, y: 0 }}
+      viewport={{ once: true, margin: '-60px' }}
+      transition={{ duration: 0.4 }}
+    >
+      <p className="text-xs font-semibold uppercase tracking-wide text-[var(--accent)]">
+        Quality &amp; trust
+      </p>
+      <h2 className="mt-1 text-2xl font-semibold text-neutral-950 dark:text-white">
+        How we keep it grounded and cited
+      </h2>
+      <p className="mt-2 max-w-3xl text-sm leading-7 text-neutral-600 dark:text-neutral-300">
+        Synapse is built to minimize hallucination. Briefs draw on retrieved evidence, cite their
+        sources, and are checked for unverifiable references before you read them.
+      </p>
+      <div className="mt-6 grid gap-3 sm:grid-cols-2">
+        {HEALTH_CASE_GROUNDING_POINTS.map((point) => (
+          <div
+            key={point.title}
+            className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800"
+          >
+            <p className="text-sm font-semibold text-neutral-950 dark:text-white">{point.title}</p>
+            <p className="mt-1 text-sm leading-6 text-neutral-500 dark:text-neutral-400">
+              {point.description}
+            </p>
+          </div>
+        ))}
+      </div>
+      <p className="mt-5 text-xs leading-6 text-neutral-500 dark:text-neutral-400">
+        Educational research only — not a diagnosis or medical advice. Always confirm against the
+        primary source and your clinical team before acting on anything in a brief.
+      </p>
+    </motion.section>
+  );
+}
+
+function CaseListSkeleton() {
+  const reduceMotion = useReducedMotion();
+  return (
+    <>
+      {Array.from({ length: 2 }).map((_, index) => (
+        <motion.div
+          key={index}
+          className="rounded-2xl border border-neutral-200 p-4 dark:border-neutral-800"
+          animate={reduceMotion ? undefined : { opacity: [0.55, 1, 0.55] }}
+          transition={{ duration: 1.6, repeat: Infinity, ease: 'easeInOut' }}
+        >
+          <div className="h-4 w-2/3 rounded-full bg-neutral-200 dark:bg-neutral-800" />
+          <div className="mt-3 h-3 w-1/2 rounded-full bg-neutral-200 dark:bg-neutral-800" />
+        </motion.div>
+      ))}
+    </>
+  );
+}
+
 export function HealthCasesDashboard() {
   const { data, isLoading, error } = useHealthCases();
+  const reduceMotion = useReducedMotion();
+  useImmersiveSidebar();
 
   return (
     <div className="synapse-page-bg min-h-screen">
-      <main className="mx-auto flex w-full max-w-7xl flex-col gap-8 p-4 py-8 md:p-8">
-        <section className="mx-auto w-full max-w-5xl text-center">
-          <div className="flex justify-center">
-            <BetaCardiologyPill />
-          </div>
-          <h1 className="mx-auto mt-4 max-w-4xl text-4xl font-bold tracking-tight text-neutral-950 dark:text-white md:text-6xl">
-            Tell us about your case. We&rsquo;ll bring back the latest expert perspectives.
+      <SidebarRestoreHandle />
+      <main className="mx-auto flex w-full max-w-[1400px] flex-col gap-8 p-4 py-8 md:p-8 lg:py-10">
+        <motion.section
+          className="mx-auto flex w-full max-w-4xl flex-col items-center text-center"
+          initial={reduceMotion ? false : { opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
+        >
+          <SplashLogoOrb className="mb-5" />
+          <BetaCardiologyPill />
+          <h1 className="mx-auto mt-4 max-w-3xl text-4xl font-bold tracking-tight text-neutral-950 dark:text-white md:text-6xl">
+            The latest research in your hands.
           </h1>
-          <p className="mx-auto mt-5 max-w-3xl text-base leading-7 text-neutral-600 dark:text-neutral-300 md:text-lg">
-            Chat through the case in plain English and attach any records you have. Synapse comes
-            back with what the experts are saying, who&rsquo;s working on it, the relevant clinical
-            trials, and the latest research papers — every claim cited. Behind the scenes, a Google
-            ADK agent team splits evidence, trial, and researcher discovery before synthesizing the
-            brief. While we&rsquo;re in beta we focus on cardiology cases.
+          <p className="mx-auto mt-4 max-w-2xl text-base leading-7 text-neutral-600 dark:text-neutral-300 md:text-lg">
+            Describe your health case — Synapse returns the latest research, trials, and expert
+            thinking, every claim cited.
           </p>
-          <p className="mx-auto mt-3 max-w-2xl text-xs text-neutral-500 dark:text-neutral-400">
-            Educational research only — not a diagnosis or medical advice. Records are encrypted and
-            only used for your case.
-          </p>
-        </section>
+        </motion.section>
 
         <CreateCaseCard />
+
+        <HealthCaseValueStrip />
+
+        <HealthCaseGroundingSection />
 
         <section className="synapse-card rounded-[28px] p-6">
           <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
@@ -1175,9 +1572,9 @@ export function HealthCasesDashboard() {
               Confirmed cases, uploaded records, and generated briefs live here.
             </p>
           </div>
-          {isLoading && <LoadingSpinner />}
           {error && <p className="mt-4 text-sm text-red-600">{error.message}</p>}
           <div className="mt-5 grid gap-3 md:grid-cols-2">
+            {isLoading && <CaseListSkeleton />}
             {(data || []).length === 0 && !isLoading ? (
               <p className="rounded-2xl border border-dashed border-neutral-300 p-5 text-sm text-neutral-600 dark:border-neutral-700 dark:text-neutral-300 md:col-span-2">
                 No Health Cases yet. Create one above to upload records and generate Expert
@@ -1227,6 +1624,8 @@ type DetailMessage =
       researchers?: HealthCaseResearcher[];
       clinicalTrials?: HealthCaseClinicalTrial[];
       feedSuggestions?: HealthCaseFeedSuggestion[];
+      sources?: Array<Record<string, unknown>>;
+      citationGrounding?: HealthCaseCitationGrounding | null;
     }
   | {
       kind: 'error';
@@ -1479,8 +1878,92 @@ function ProfileEditorInline({
   );
 }
 
+function DigestSubscribeCard({ healthCase }: { healthCase: HealthCase }) {
+  const updateDigest = useUpdateHealthCaseDigest(healthCase.id);
+  const enabled = Boolean(healthCase.digest_enabled);
+  const [email, setEmail] = useState('');
+  const [error, setError] = useState('');
+
+  const subscribe = async () => {
+    setError('');
+    try {
+      await updateDigest.mutateAsync({
+        enabled: true,
+        email: email.trim() || undefined,
+      });
+      setEmail('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not subscribe');
+    }
+  };
+
+  const unsubscribe = async () => {
+    setError('');
+    try {
+      await updateDigest.mutateAsync({ enabled: false });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not update');
+    }
+  };
+
+  return (
+    <section className="synapse-card rounded-[28px] p-5 md:p-6">
+      <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">
+            Weekly updates
+          </p>
+          <h2 className="mt-1 text-lg font-semibold text-neutral-950 dark:text-white">
+            Get a weekly digest for this case
+          </h2>
+          <p className="mt-1 max-w-2xl text-sm leading-6 text-neutral-600 dark:text-neutral-300">
+            We&rsquo;ll email new research, trials, and expert discussion on{' '}
+            {healthCase.condition_terms?.length
+              ? healthCase.condition_terms.slice(0, 3).join(', ')
+              : 'this case'}{' '}
+            as it appears — every claim cited.
+          </p>
+        </div>
+
+        {enabled ? (
+          <div className="flex shrink-0 flex-col items-start gap-2 md:items-end">
+            <span className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700 dark:border-emerald-900/60 dark:bg-emerald-950/30 dark:text-emerald-200">
+              <span aria-hidden>✓</span> Subscribed
+            </span>
+            <button
+              type="button"
+              onClick={unsubscribe}
+              disabled={updateDigest.isPending}
+              className="text-xs text-neutral-500 underline-offset-2 hover:underline disabled:opacity-60 dark:text-neutral-400"
+            >
+              {updateDigest.isPending ? 'Updating…' : 'Unsubscribe'}
+            </button>
+          </div>
+        ) : (
+          <div className="flex w-full shrink-0 flex-col gap-2 sm:flex-row md:w-auto">
+            <input
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="you@example.com"
+              aria-label="Email for weekly updates"
+              className="w-full rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-2.5 text-sm text-neutral-900 outline-none transition placeholder:text-neutral-400 focus:border-sky-400 focus:bg-white focus:ring-2 focus:ring-sky-100 sm:w-64 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white dark:placeholder:text-neutral-500 dark:focus:border-sky-500 dark:focus:ring-sky-950"
+              data-posthog-mask
+            />
+            <Button onClick={subscribe} disabled={updateDigest.isPending} className="rounded-2xl">
+              {updateDigest.isPending ? 'Subscribing…' : 'Subscribe'}
+            </Button>
+          </div>
+        )}
+      </div>
+      {error && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>}
+    </section>
+  );
+}
+
 export function HealthCaseDetail({ caseId }: { caseId: string }) {
   const router = useRouter();
+  useImmersiveSidebar();
   const { data, isLoading, error, refetch } = useHealthCase(caseId);
   const deleteCase = useDeleteHealthCase();
   const upload = useUploadHealthCaseDocument(caseId);
@@ -1494,12 +1977,17 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
   const [actionError, setActionError] = useState('');
   const [activeBriefMessageId, setActiveBriefMessageId] = useState<string | null>(null);
   const seededRef = useRef(false);
-  const endOfMessagesRef = useRef<HTMLDivElement | null>(null);
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
   // Synchronous lock for the brief-generation guard. `useState` /
   // `activeBriefMessageId` would lag behind a fast double-click because the
   // state setter is queued for the next render — a `useRef` flips
   // immediately and is shared across closures.
   const briefGenerationLock = useRef(false);
+  // `?continue=1` is set by the intake "Yes — create Health Case" button.
+  // Since the user already confirmed there, we auto-start Expert Research on
+  // arrival instead of asking them to type "yes" a second time.
+  const [continueParam, setContinueParam] = useQueryState('continue');
+  const autoStartedRef = useRef(false);
 
   // Seed messages from the prior intake transcript + current case state.
   useEffect(() => {
@@ -1546,6 +2034,8 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
           researchers: savedBrief.researchers || [],
           clinicalTrials: savedBrief.clinical_trials || [],
           feedSuggestions: savedBrief.feed_suggestions || [],
+          sources: savedBrief.sources || [],
+          citationGrounding: savedBrief.citation_grounding || null,
         });
       }
     }
@@ -1553,8 +2043,11 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
     setMessages(seeded);
   }, [data, caseId]);
 
+  // Scroll only the chat container, not the window — see CreateCaseCard.
   useEffect(() => {
-    endOfMessagesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
   }, [messages.length, brief.isStreaming, brief.content]);
 
   // Stream brief content into the active assistant brief message.
@@ -1570,6 +2063,8 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
               researchers: brief.savedBrief?.researchers || message.researchers,
               clinicalTrials: brief.savedBrief?.clinical_trials || message.clinicalTrials,
               feedSuggestions: brief.savedBrief?.feed_suggestions || message.feedSuggestions,
+              sources: brief.savedBrief?.sources || message.sources,
+              citationGrounding: brief.savedBrief?.citation_grounding || message.citationGrounding,
               generatedAtIso: brief.savedBrief?.created_at || message.generatedAtIso,
             }
           : message
@@ -1673,6 +2168,21 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
     [brief, data, updateProfile]
   );
 
+  // Auto-kick the brief once when the user arrives straight from confirming
+  // the case ("Yes — create Health Case" → `?continue=1`). We clear the param
+  // first so a refresh or back-nav doesn't re-trigger another LLM pass, and
+  // gate on `seededRef` so the auto-started turn lands after the seeded
+  // case-summary message.
+  useEffect(() => {
+    if (autoStartedRef.current) return;
+    if (continueParam !== '1') return;
+    if (!data || !seededRef.current) return;
+    if (brief.isStreaming || briefGenerationLock.current) return;
+    autoStartedRef.current = true;
+    void setContinueParam(null);
+    void startBrief();
+  }, [continueParam, data, brief.isStreaming, startBrief, setContinueParam]);
+
   const submitTurn = async () => {
     if (!data) return;
     const trimmed = draft.trim();
@@ -1762,13 +2272,21 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
     router.push('/health-cases');
   };
 
-  if (isLoading) return <LoadingSpinner />;
+  if (isLoading) {
+    return (
+      <>
+        <SidebarRestoreHandle />
+        <PageSkeleton variant="single" />
+      </>
+    );
+  }
   if (error) return <p className="p-8 text-sm text-red-600">{error.message}</p>;
   if (!data) return null;
 
   return (
     <div className="synapse-page-bg min-h-screen">
-      <main className="mx-auto flex w-full max-w-6xl flex-col gap-6 p-4 py-8 md:p-8">
+      <SidebarRestoreHandle />
+      <main className="mx-auto flex w-full max-w-[1400px] flex-col gap-6 p-4 py-8 md:p-8 lg:py-10">
         <div className="flex items-center justify-between gap-3">
           <Link href="/health-cases" className="text-sm text-sky-700 hover:underline">
             ← Back to Health Cases
@@ -1861,12 +2379,17 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
           )}
         </section>
 
+        <DigestSubscribeCard healthCase={data} />
+
         <BorderBeam size="md" duration={9} colorVariant="ocean" theme="auto" className="w-full">
           <section className="relative overflow-hidden rounded-[36px] synapse-glass-strong">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(78,157,252,0.16),transparent_28rem),radial-gradient(circle_at_80%_10%,rgba(129,140,248,0.12),transparent_24rem)]" />
 
             <div className="relative space-y-5 p-4 md:p-6 lg:p-8">
-              <div className="max-h-[640px] min-h-[320px] space-y-5 overflow-y-auto rounded-[30px] border border-white/70 bg-white/45 p-4 pr-2 shadow-inner dark:border-white/[0.06] dark:bg-black/10 md:p-6">
+              <div
+                ref={messagesContainerRef}
+                className="max-h-[640px] min-h-[320px] space-y-5 overflow-y-auto rounded-[30px] border border-white/70 bg-white/45 p-4 pr-2 shadow-inner dark:border-white/[0.06] dark:bg-black/10 md:p-6"
+              >
                 {messages.map((message) => {
                   if (message.kind === 'text') {
                     return (
@@ -1925,19 +2448,26 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
                           ) : null}
                         </div>
                         {message.content ? (
-                          <ExpertResearchBrief
-                            caseId={data.id}
-                            content={message.content}
-                            researchers={message.researchers}
-                            clinicalTrials={message.clinicalTrials}
-                            feedSuggestions={message.feedSuggestions}
-                          />
+                          <>
+                            <ExpertResearchBrief
+                              caseId={data.id}
+                              content={message.content}
+                              researchers={message.researchers}
+                              clinicalTrials={message.clinicalTrials}
+                              feedSuggestions={message.feedSuggestions}
+                              sources={message.sources}
+                              citationGrounding={message.citationGrounding}
+                            />
+                            {briefIsComplete && briefHasStructuredSections(message.content) ? (
+                              <BriefFinishedActions
+                                caseId={data.id}
+                                feedSuggestions={message.feedSuggestions}
+                                conditionTerms={data.condition_terms || []}
+                              />
+                            ) : null}
+                          </>
                         ) : (
-                          <p className="mt-3 text-sm text-neutral-500">
-                            Synapse is reading evidence, talking to its tools, and pulling
-                            citations. This usually takes ~30s
-                            <AnimatedDots />
-                          </p>
+                          <BriefGeneratingPlaceholder />
                         )}
                       </div>
                     </ChatBubble>
@@ -1946,7 +2476,6 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
                 {brief.isStreaming && !activeBriefMessageId && (
                   <ChatTypingBubble label="Generating Expert Research" />
                 )}
-                <div ref={endOfMessagesRef} />
               </div>
 
               <ChatComposer

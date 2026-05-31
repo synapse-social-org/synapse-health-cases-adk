@@ -106,12 +106,19 @@ def _mcp_enabled() -> bool:
 
 
 def _build_mcp_toolset():
-    """Spawn the Health Cases MCP server and return an ADK McpToolset."""
+    """Spawn the Health Cases MCP server and return an ADK McpToolset.
+
+    Returns ``None`` when MCP is unavailable so the brief can fall back to the
+    inline ``clinical_trials_lookup`` function tool without failing closed.
+    """
 
     try:
-        from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StdioConnectionParams
+        from google.adk.tools.mcp_tool.mcp_toolset import (
+            McpToolset,
+            StdioConnectionParams,
+        )
         from mcp import StdioServerParameters
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - depends on optional package
         logger.warning("Health Cases MCP toolset unavailable: %s", exc)
         return None
 
@@ -127,7 +134,7 @@ def _build_mcp_toolset():
             ),
             tool_filter=["clinical_trials_lookup"],
         )
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover - spawn failures are env-specific
         logger.warning("Failed to configure Health Cases MCP toolset: %s", exc)
         sentry_sdk.capture_exception(exc)
         return None
@@ -148,6 +155,91 @@ def _import_google_search_tool():
         return google_search
     except Exception:  # pragma: no cover - depends on optional package
         return None
+
+
+def _exa_enabled() -> bool:
+    """Exa enrichment is opt-in for the brief via HEALTH_CASE_ENABLE_EXA."""
+    return os.environ.get("HEALTH_CASE_ENABLE_EXA", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def exa_web_search(query: str) -> dict:
+    """ADK function tool: broad web/news search for a Health Case via Exa.
+
+    Surfaces authoritative web sources (guideline pages, society/regulatory
+    statements, reputable news) that PubMed/OpenAlex miss. Always safe to call;
+    returns an empty list when Exa is unconfigured or errors.
+
+    Args:
+        query: A focused clinical web query (condition, drug, guideline, trial,
+            or expert name).
+
+    Returns:
+        A dict with a ``results`` list of ``{title, url, published_date,
+        snippet}``.
+    """
+    try:
+        from services.exa import search_news
+
+        raw = search_news(query, num_results=6) or []
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Exa web search failed: %s", exc)
+        return {"results": []}
+
+    results = []
+    for item in raw:
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        text = item.get("text") or ""
+        results.append(
+            {
+                "title": (item.get("title") or "Untitled")[:300],
+                "url": item.get("url"),
+                "published_date": item.get("published_date") or "",
+                "snippet": (text[:600]).strip() if isinstance(text, str) else "",
+            }
+        )
+    return {"results": results}
+
+
+def _build_exa_agent(agent_cls, model):
+    """Optional Exa-grounded research sub-agent.
+
+    Returns ``None`` (so the brief proceeds without it) unless the
+    ``HEALTH_CASE_ENABLE_EXA`` flag is on. Mirrors the web_discourse_agent
+    pattern: an isolated sub-agent with a single web-search tool and its own
+    optional output_key, so disabled/unconfigured Exa degrades cleanly. The
+    underlying ``services.exa`` client itself no-ops without an API key.
+    """
+    if not _exa_enabled():
+        return None
+
+    return agent_cls(
+        model=model,
+        name="exa_web_research_agent",
+        description=(
+            "Broadens discovery via Exa neural web search (guidelines, society "
+            "statements, news, trial-site and patient-org pages)."
+        ),
+        instruction=(
+            "Use exa_web_search to find authoritative web sources for the "
+            "Health Case conditions that structured databases (PubMed/OpenAlex) "
+            "miss: clinical guideline pages, society/position statements, "
+            "regulatory pages, and reputable news on late-breaking results. "
+            "Prefer recent, primary, and high-credibility sources; skip "
+            "content farms and low-quality patient forums. For each item "
+            "return a one-line summary, the URL, the date if present, and why "
+            "it matters for this case. Return at most 6 items. If nothing "
+            "trustworthy is found, return the literal string 'No additional "
+            "web sources found.' rather than fabricating items."
+        ),
+        tools=[exa_web_search],
+        output_key="exa_research",
+    )
 
 
 def _run_async(coro, *, timeout_seconds: float | None = None):
@@ -620,6 +712,13 @@ def build_health_case_brief_root_agent(
     trial_tools = list(tools)
     mcp_toolset = _build_mcp_toolset() if _mcp_enabled() else None
     if mcp_toolset is not None:
+        # The MCP server exposes the same function name. Passing both providers
+        # makes Gemini reject the request with a duplicate declaration error.
+        trial_tools = [
+            tool
+            for tool in trial_tools
+            if getattr(tool, "__name__", "") != "clinical_trials_lookup"
+        ]
         trial_tools.append(mcp_toolset)
     trial_agent = Agent(
         model=model,
@@ -677,12 +776,16 @@ def build_health_case_brief_root_agent(
             output_key="web_discourse_research",
         )
         parallel_subagents.append(web_discourse_agent)
+    exa_agent = _build_exa_agent(Agent, model)
+    if exa_agent is not None:
+        parallel_subagents.append(exa_agent)
     parallel_research = ParallelAgent(
         name="health_case_parallel_research",
         sub_agents=parallel_subagents,
         description=(
             "Runs evidence, trial, researcher, and (when available) "
-            "Google-Search-grounded web discourse research in parallel."
+            "Google-Search-grounded web discourse and Exa neural-web research "
+            "in parallel."
         ),
     )
     intervention_topics_agent = Agent(
@@ -739,16 +842,19 @@ def build_health_case_brief_root_agent(
             "Researcher findings:\n{researcher_research}\n\n"
             "Web-discourse findings (Google Search grounded; may be empty):\n"
             "{web_discourse_research?}\n\n"
+            "Additional web sources (Exa neural search; may be empty):\n"
+            "{exa_research?}\n\n"
             "Topics to Discuss With Your Specialist (pre-synthesized "
             "verbatim block, drop directly under the matching section "
             "heading -- do NOT rewrite, re-cite, or expand it):\n"
             "{intervention_topics}\n\n"
             "Section 1 ('What Experts Are Saying') should weave in any "
-            "real-time signals from the web-discourse findings (regulatory "
-            "announcements, late-breaking conference results, news) with a "
-            "URL and a clear 'real-time / news' qualifier, alongside the "
-            "guideline-backed and trial-backed claims. Do not invent a "
-            "real-time signal that is not in the web-discourse findings.\n\n"
+            "real-time signals from the web-discourse and Exa web findings "
+            "(regulatory announcements, late-breaking conference results, "
+            "guideline pages, news) with a URL and a clear 'real-time / news' "
+            "qualifier, alongside the guideline-backed and trial-backed "
+            "claims. Do not invent a real-time signal that is not in those "
+            "findings.\n\n"
             "Follow the requested section headings exactly, including "
             "section 5 'Topics to Discuss With Your Specialist'. This is "
             "education and research support only, not diagnosis or medical "
@@ -834,11 +940,32 @@ def stream_health_case_brief_adk(
         yield {"type": "feed_suggestion", **event}
     for chunk in _chunk_text(result.text):
         yield {"type": "content", "content": chunk}
+
+    # Phase-1 hallucination guard, mirrored from the legacy research-agent
+    # path so the production ADK backend also surfaces unverified NCT IDs and
+    # trial acronyms. We don't mutate the streamed text — clients render a
+    # "couldn't verify these references" warning from this metadata.
+    citation_grounding = None
+    try:
+        from services.research_agent_extensions import (
+            grounding_enabled,
+            verify_citations,
+        )
+
+        if grounding_enabled() and result.text:
+            citation_grounding = verify_citations(result.text, result.papers_cited)
+    except Exception as guard_err:  # pragma: no cover - defensive
+        logger.warning("ADK citation grounding skipped: %s", guard_err)
+
     yield {
         "type": "done",
         "metadata": {
             "papers_cited": result.papers_cited,
             "agent_backend": "google_adk",
             "adk_agents": result.agent_names,
+            # Intentionally None when the guard is disabled or the agent
+            # produced no text, so clients distinguish "checked, found
+            # nothing" from "didn't check this run".
+            "citation_grounding": citation_grounding,
         },
     }
