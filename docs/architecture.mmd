@@ -1,14 +1,15 @@
 graph LR
   U[User<br/>Next.js Health Cases UI] -->|POST /health-cases| API[Flask API on AWS ECS]
   API -->|SSE stream| U
-  API -->|Runner.run_async| ADK[Google ADK Orchestrator]
-  ADK --> Intake[Intake Agent<br/>Gemini]
+  API -->|Runner.run_async| ADK[Google ADK Orchestrator<br/>SequentialAgent · health_case_navigator]
+  ADK --> Intake[Intake Agent<br/>Gemini · confirm-before-save]
   ADK --> Research[ParallelAgent<br/>Research stage]
   Research --> T1[paper_search tool]
   Research --> T2[researcher_match tool]
-  Research --> T3[clinical_trials_lookup tool]
-  Research --> MCP[MCP clinical_trials_lookup<br/>stdio server]
+  Research --> T3[clinical_trials_lookup tool<br/>inline fallback]
+  Research --> MCP[MCP clinical_trials_lookup<br/>stdio server · synapse_mcp_server]
   Research --> Web[web_discourse_agent<br/>Google Search grounding]
+  Research --> Exa[exa_web_research_agent<br/>Exa neural web search]
   ADK --> Topics[Topics to Discuss<br/>Agent / Gemini<br/>citation-grounded]
   Topics --> Synth[Synthesis Agent<br/>Gemini]
   T1 --> OA[(OpenAlex)]
@@ -17,15 +18,27 @@ graph LR
   T3 --> CT[(ClinicalTrials.gov v2)]
   MCP --> CT
   Web --> GoogleSearch[(Google Search)]
-  Synth --> API
+  Exa --> ExaAPI[(Exa API)]
+  Synth --> Guard{Citation Guard<br/>verify_citations<br/>NCT registry check}
+  Guard -->|guarded brief| API
+  Guard -.->|unverified NCTs / acronyms| Banner[/References we could not verify banner/]
+  Guard -.->|verify NCT IDs| CT
+  API -.->|subscribe case| Digest[Weekly what's-new digest email<br/>health_case_digest cron · delta builder]
+  Digest -.->|weekly| U
   API -.timeout / error fallback.-> Legacy[Legacy single-model research agent]
   classDef gcp fill:#4285F4,stroke:#1a73e8,color:white
   classDef tool fill:#34A853,stroke:#0f9d58,color:white
   classDef ext fill:#fbbc04,stroke:#f9ab00,color:#333
   classDef api fill:#EA4335,stroke:#c5221f,color:white
   classDef fallback fill:#9aa0a6,stroke:#5f6368,color:white
-  class ADK,Intake,Research,Synth,Topics,Web gcp
+  classDef guard fill:#A142F4,stroke:#7627bb,color:white
+  classDef warn fill:#fce8e6,stroke:#c5221f,color:#c5221f
+  classDef monitor fill:#12B5CB,stroke:#098591,color:white
+  class ADK,Intake,Research,Synth,Topics,Web,Exa gcp
   class T1,T2,T3,MCP tool
-  class OA,NPI,Mongo,CT,GoogleSearch ext
+  class OA,NPI,Mongo,CT,GoogleSearch,ExaAPI ext
   class API api
   class Legacy fallback
+  class Guard guard
+  class Banner warn
+  class Digest monitor
