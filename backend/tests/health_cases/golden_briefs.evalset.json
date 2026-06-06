@@ -1,0 +1,168 @@
+{
+  "eval_set_id": "synapse_health_cases_golden",
+  "name": "Synapse Health Cases Golden Briefs",
+  "description": "Curated Health Case intake fixtures for ADK AgentEvaluator and Synapse brief-quality scorecards.",
+  "eval_cases": [
+    {
+      "eval_id": "mactel_diabetes_ckd_67m",
+      "conversation": [
+        {
+          "invocation_id": "mactel_diabetes_ckd_67m_brief",
+          "user_content": {
+            "parts": [
+              {
+                "media_resolution": null,
+                "code_execution_result": null,
+                "executable_code": null,
+                "file_data": null,
+                "function_call": null,
+                "function_response": null,
+                "inline_data": null,
+                "text": "Create a cardiology-first Expert Research brief for this user-reviewed Health Case profile. This is research education, not diagnosis or medical advice. Do not invent facts from the uploaded records.\n\nUse tools for guidelines, clinical trials, latest papers, evidence graph signals, knowledge graph context, editorials, expert commentary, and X/web discourse. Label clinicians as relevant researchers, trialists, or centers of expertise; do not claim they are the 'best doctors' by care-quality outcomes.\n\nFormat the answer with EXACTLY these markdown section headings in this order:\n## 1. What Experts Are Saying\n- Summarize the strongest expert/evidence signals from guidelines, knowledge graph, evidence graph, editorials, conference discussion, and X/web commentary. Call out whether a claim is guideline-backed, trial-backed, editorial/commentary, or emerging.\n\n## 2. Relevant Research Papers\n- List the most relevant papers with title, first author when known, year, why it matters for this case, and citation/source details. End this section with a 'Create Feed' recommendation containing a feed topic and search terms.\n\n## 3. Relevant Researchers\n- List relevant researchers or centers with their rationale, institution when known, and what to ask them about. Include 'Request Contact' as the user action for each researcher. Use Synapse profile identifiers or links when available; otherwise state that the profile should be matched before outreach.\n\n## 4. Clinical Trials\n- List relevant trials with NCT IDs when available, status, phase, intervention, eligibility caveats, location notes if known, and why the trial may or may not fit this case.\n\n## 5. Topics to Discuss With Your Specialist\n- Open the section with a one-sentence disclaimer that these are research-grounded conversation topics, not medical advice. Then list 3-6 bullets, each phrased as a topic or question to raise (never as an instruction), grounded in a specific paper title, NCT ID, or researcher mentioned elsewhere in this brief. Avoid dosages, specific drug doses, and 'you should' language; talk about classes or themes. End each bullet with the relevant specialist in parentheses, e.g. '(retina specialist)' or '(nephrology)'. If fewer than three citation-grounded topics can be supported, write only the disclaimer and explain that the brief did not surface enough cited material for safe discussion topics.\n\n## 6. Feedback\n- Ask the user what was helpful, what is missing, and what context would improve the next pass. Suggest 2-3 concrete follow-up questions the system should ask.\n\nHealth Case profile JSON:\n{\"condition_terms\": [\"Diabetes\", \"Idiopathic juxtafoveal retinal telangiectasia\", \"Stage 3A Chronic Kidney Disease (CKD)\"], \"extra_question\": \"\", \"primary_specialty\": \"cardiology\", \"profile\": {\"conditions\": [\"Diabetes\", \"MacTel\", \"Stage 3A CKD\"], \"goals\": [\"Address vision loss\", \"Manage concurrent conditions\"], \"symptoms\": [\"Vision loss\"]}}",
+                "thought": null,
+                "thought_signature": null,
+                "video_metadata": null
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": null,
+          "intermediate_data": null,
+          "creation_timestamp": 0.0,
+          "rubrics": null,
+          "app_details": null
+        }
+      ],
+      "conversation_scenario": null,
+      "session_input": {
+        "app_name": "synapse_health_case_navigator",
+        "user_id": "eval_mactel_diabetes_ckd_67m",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "rubrics": null,
+      "final_session_state": {}
+    },
+    {
+      "eval_id": "hfpef_older_adult",
+      "conversation": [
+        {
+          "invocation_id": "hfpef_older_adult_brief",
+          "user_content": {
+            "parts": [
+              {
+                "media_resolution": null,
+                "code_execution_result": null,
+                "executable_code": null,
+                "file_data": null,
+                "function_call": null,
+                "function_response": null,
+                "inline_data": null,
+                "text": "Create a cardiology-first Expert Research brief for this user-reviewed Health Case profile. This is research education, not diagnosis or medical advice. Do not invent facts from the uploaded records.\n\nUse tools for guidelines, clinical trials, latest papers, evidence graph signals, knowledge graph context, editorials, expert commentary, and X/web discourse. Label clinicians as relevant researchers, trialists, or centers of expertise; do not claim they are the 'best doctors' by care-quality outcomes.\n\nFormat the answer with EXACTLY these markdown section headings in this order:\n## 1. What Experts Are Saying\n- Summarize the strongest expert/evidence signals from guidelines, knowledge graph, evidence graph, editorials, conference discussion, and X/web commentary. Call out whether a claim is guideline-backed, trial-backed, editorial/commentary, or emerging.\n\n## 2. Relevant Research Papers\n- List the most relevant papers with title, first author when known, year, why it matters for this case, and citation/source details. End this section with a 'Create Feed' recommendation containing a feed topic and search terms.\n\n## 3. Relevant Researchers\n- List relevant researchers or centers with their rationale, institution when known, and what to ask them about. Include 'Request Contact' as the user action for each researcher. Use Synapse profile identifiers or links when available; otherwise state that the profile should be matched before outreach.\n\n## 4. Clinical Trials\n- List relevant trials with NCT IDs when available, status, phase, intervention, eligibility caveats, location notes if known, and why the trial may or may not fit this case.\n\n## 5. Topics to Discuss With Your Specialist\n- Open the section with a one-sentence disclaimer that these are research-grounded conversation topics, not medical advice. Then list 3-6 bullets, each phrased as a topic or question to raise (never as an instruction), grounded in a specific paper title, NCT ID, or researcher mentioned elsewhere in this brief. Avoid dosages, specific drug doses, and 'you should' language; talk about classes or themes. End each bullet with the relevant specialist in parentheses, e.g. '(retina specialist)' or '(nephrology)'. If fewer than three citation-grounded topics can be supported, write only the disclaimer and explain that the brief did not surface enough cited material for safe discussion topics.\n\n## 6. Feedback\n- Ask the user what was helpful, what is missing, and what context would improve the next pass. Suggest 2-3 concrete follow-up questions the system should ask.\n\nHealth Case profile JSON:\n{\"condition_terms\": [\"Heart failure with preserved ejection fraction\", \"Atrial fibrillation\"], \"extra_question\": \"\", \"primary_specialty\": \"cardiology\", \"profile\": {\"conditions\": [\"HFpEF\", \"Atrial fibrillation\"], \"goals\": [\"Symptom relief\", \"Reduce hospitalizations\"], \"symptoms\": [\"Dyspnea on exertion\", \"Fatigue\"]}}",
+                "thought": null,
+                "thought_signature": null,
+                "video_metadata": null
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": null,
+          "intermediate_data": null,
+          "creation_timestamp": 0.0,
+          "rubrics": null,
+          "app_details": null
+        }
+      ],
+      "conversation_scenario": null,
+      "session_input": {
+        "app_name": "synapse_health_case_navigator",
+        "user_id": "eval_hfpef_older_adult",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "rubrics": null,
+      "final_session_state": {}
+    },
+    {
+      "eval_id": "pediatric_long_qt",
+      "conversation": [
+        {
+          "invocation_id": "pediatric_long_qt_brief",
+          "user_content": {
+            "parts": [
+              {
+                "media_resolution": null,
+                "code_execution_result": null,
+                "executable_code": null,
+                "file_data": null,
+                "function_call": null,
+                "function_response": null,
+                "inline_data": null,
+                "text": "Create a cardiology-first Expert Research brief for this user-reviewed Health Case profile. This is research education, not diagnosis or medical advice. Do not invent facts from the uploaded records.\n\nUse tools for guidelines, clinical trials, latest papers, evidence graph signals, knowledge graph context, editorials, expert commentary, and X/web discourse. Label clinicians as relevant researchers, trialists, or centers of expertise; do not claim they are the 'best doctors' by care-quality outcomes.\n\nFormat the answer with EXACTLY these markdown section headings in this order:\n## 1. What Experts Are Saying\n- Summarize the strongest expert/evidence signals from guidelines, knowledge graph, evidence graph, editorials, conference discussion, and X/web commentary. Call out whether a claim is guideline-backed, trial-backed, editorial/commentary, or emerging.\n\n## 2. Relevant Research Papers\n- List the most relevant papers with title, first author when known, year, why it matters for this case, and citation/source details. End this section with a 'Create Feed' recommendation containing a feed topic and search terms.\n\n## 3. Relevant Researchers\n- List relevant researchers or centers with their rationale, institution when known, and what to ask them about. Include 'Request Contact' as the user action for each researcher. Use Synapse profile identifiers or links when available; otherwise state that the profile should be matched before outreach.\n\n## 4. Clinical Trials\n- List relevant trials with NCT IDs when available, status, phase, intervention, eligibility caveats, location notes if known, and why the trial may or may not fit this case.\n\n## 5. Topics to Discuss With Your Specialist\n- Open the section with a one-sentence disclaimer that these are research-grounded conversation topics, not medical advice. Then list 3-6 bullets, each phrased as a topic or question to raise (never as an instruction), grounded in a specific paper title, NCT ID, or researcher mentioned elsewhere in this brief. Avoid dosages, specific drug doses, and 'you should' language; talk about classes or themes. End each bullet with the relevant specialist in parentheses, e.g. '(retina specialist)' or '(nephrology)'. If fewer than three citation-grounded topics can be supported, write only the disclaimer and explain that the brief did not surface enough cited material for safe discussion topics.\n\n## 6. Feedback\n- Ask the user what was helpful, what is missing, and what context would improve the next pass. Suggest 2-3 concrete follow-up questions the system should ask.\n\nHealth Case profile JSON:\n{\"condition_terms\": [\"Long QT syndrome\", \"Congenital arrhythmia\"], \"extra_question\": \"\", \"primary_specialty\": \"cardiology\", \"profile\": {\"conditions\": [\"Long QT syndrome\"], \"goals\": [\"Safe return to activity guidance\", \"Family screening context\"], \"symptoms\": [\"Syncope with exertion\"]}}",
+                "thought": null,
+                "thought_signature": null,
+                "video_metadata": null
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": null,
+          "intermediate_data": null,
+          "creation_timestamp": 0.0,
+          "rubrics": null,
+          "app_details": null
+        }
+      ],
+      "conversation_scenario": null,
+      "session_input": {
+        "app_name": "synapse_health_case_navigator",
+        "user_id": "eval_pediatric_long_qt",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "rubrics": null,
+      "final_session_state": {}
+    },
+    {
+      "eval_id": "car_t_lymphoma_candidate",
+      "conversation": [
+        {
+          "invocation_id": "car_t_lymphoma_candidate_brief",
+          "user_content": {
+            "parts": [
+              {
+                "media_resolution": null,
+                "code_execution_result": null,
+                "executable_code": null,
+                "file_data": null,
+                "function_call": null,
+                "function_response": null,
+                "inline_data": null,
+                "text": "Create a cardiology-first Expert Research brief for this user-reviewed Health Case profile. This is research education, not diagnosis or medical advice. Do not invent facts from the uploaded records.\n\nUse tools for guidelines, clinical trials, latest papers, evidence graph signals, knowledge graph context, editorials, expert commentary, and X/web discourse. Label clinicians as relevant researchers, trialists, or centers of expertise; do not claim they are the 'best doctors' by care-quality outcomes.\n\nFormat the answer with EXACTLY these markdown section headings in this order:\n## 1. What Experts Are Saying\n- Summarize the strongest expert/evidence signals from guidelines, knowledge graph, evidence graph, editorials, conference discussion, and X/web commentary. Call out whether a claim is guideline-backed, trial-backed, editorial/commentary, or emerging.\n\n## 2. Relevant Research Papers\n- List the most relevant papers with title, first author when known, year, why it matters for this case, and citation/source details. End this section with a 'Create Feed' recommendation containing a feed topic and search terms.\n\n## 3. Relevant Researchers\n- List relevant researchers or centers with their rationale, institution when known, and what to ask them about. Include 'Request Contact' as the user action for each researcher. Use Synapse profile identifiers or links when available; otherwise state that the profile should be matched before outreach.\n\n## 4. Clinical Trials\n- List relevant trials with NCT IDs when available, status, phase, intervention, eligibility caveats, location notes if known, and why the trial may or may not fit this case.\n\n## 5. Topics to Discuss With Your Specialist\n- Open the section with a one-sentence disclaimer that these are research-grounded conversation topics, not medical advice. Then list 3-6 bullets, each phrased as a topic or question to raise (never as an instruction), grounded in a specific paper title, NCT ID, or researcher mentioned elsewhere in this brief. Avoid dosages, specific drug doses, and 'you should' language; talk about classes or themes. End each bullet with the relevant specialist in parentheses, e.g. '(retina specialist)' or '(nephrology)'. If fewer than three citation-grounded topics can be supported, write only the disclaimer and explain that the brief did not surface enough cited material for safe discussion topics.\n\n## 6. Feedback\n- Ask the user what was helpful, what is missing, and what context would improve the next pass. Suggest 2-3 concrete follow-up questions the system should ask.\n\nHealth Case profile JSON:\n{\"condition_terms\": [\"Diffuse large B-cell lymphoma\", \"Relapsed lymphoma\"], \"extra_question\": \"\", \"primary_specialty\": \"oncology\", \"profile\": {\"conditions\": [\"DLBCL\"], \"goals\": [\"CAR-T eligibility\", \"Trial options\"], \"symptoms\": [\"B symptoms\"]}}",
+                "thought": null,
+                "thought_signature": null,
+                "video_metadata": null
+              }
+            ],
+            "role": "user"
+          },
+          "final_response": null,
+          "intermediate_data": null,
+          "creation_timestamp": 0.0,
+          "rubrics": null,
+          "app_details": null
+        }
+      ],
+      "conversation_scenario": null,
+      "session_input": {
+        "app_name": "synapse_health_case_navigator",
+        "user_id": "eval_car_t_lymphoma_candidate",
+        "state": {}
+      },
+      "creation_timestamp": 0.0,
+      "rubrics": null,
+      "final_session_state": {}
+    }
+  ],
+  "creation_timestamp": 0.0
+}

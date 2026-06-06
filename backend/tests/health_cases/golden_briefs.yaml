@@ -1,0 +1,127 @@
+# Health Cases ADK eval fixtures. Each case exercises a distinct brief-quality
+# dimension for the Google ADK multi-agent Health Case Navigator.
+#
+# Field reference:
+#   id               : stable string id (used in scorecard output)
+#   description      : human-readable label
+#   intake_payload   : Health Case profile JSON fed to build_health_case_brief_prompt
+#   must_mention     : substrings that MUST appear (case-insensitive)
+#   should_not_mention : substrings the brief MUST NOT contain
+#   min_papers_cited : minimum papers in done-event metadata
+#   min_trials_cited : minimum NCT IDs in the brief text
+#   min_topics_cited : minimum bullets under Topics to Discuss
+#   max_latency_seconds : wall-clock upper bound for a live brief run
+
+cases:
+  - id: mactel_diabetes_ckd_67m
+    description: 67M with MacTel, diabetes, Stage 3A CKD, and vision loss
+    intake_payload:
+      primary_specialty: cardiology
+      condition_terms:
+        - Diabetes
+        - Idiopathic juxtafoveal retinal telangiectasia
+        - Stage 3A Chronic Kidney Disease (CKD)
+      profile:
+        conditions:
+          - Diabetes
+          - MacTel
+          - Stage 3A CKD
+        symptoms:
+          - Vision loss
+        goals:
+          - Address vision loss
+          - Manage concurrent conditions
+    must_mention:
+      - "## 1. What Experts Are Saying"
+      - "## 2. Relevant Research Papers"
+      - "## 4. Clinical Trials"
+      - "## 5. Topics to Discuss With Your Specialist"
+      - not medical advice
+    should_not_mention:
+      - you should take
+      - prescribe
+    min_papers_cited: 1
+    min_trials_cited: 0
+    min_topics_cited: 1
+    max_latency_seconds: 900
+
+  - id: hfpef_older_adult
+    description: 78F with HFpEF, atrial fibrillation, and frailty
+    intake_payload:
+      primary_specialty: cardiology
+      condition_terms:
+        - Heart failure with preserved ejection fraction
+        - Atrial fibrillation
+      profile:
+        conditions:
+          - HFpEF
+          - Atrial fibrillation
+        symptoms:
+          - Dyspnea on exertion
+          - Fatigue
+        goals:
+          - Symptom relief
+          - Reduce hospitalizations
+    must_mention:
+      - "## 1. What Experts Are Saying"
+      - HFpEF
+      - "## 4. Clinical Trials"
+      - "## 5. Topics to Discuss With Your Specialist"
+    should_not_mention:
+      - HFrEF-only
+    min_papers_cited: 1
+    min_trials_cited: 0
+    min_topics_cited: 1
+    max_latency_seconds: 900
+
+  - id: pediatric_long_qt
+    description: 14M with congenital long QT syndrome and exercise restriction
+    intake_payload:
+      primary_specialty: cardiology
+      condition_terms:
+        - Long QT syndrome
+        - Congenital arrhythmia
+      profile:
+        conditions:
+          - Long QT syndrome
+        symptoms:
+          - Syncope with exertion
+        goals:
+          - Safe return to activity guidance
+          - Family screening context
+    must_mention:
+      - "## 1. What Experts Are Saying"
+      - long QT
+      - "## 3. Relevant Researchers"
+      - "## 5. Topics to Discuss With Your Specialist"
+    should_not_mention: []
+    min_papers_cited: 1
+    min_trials_cited: 0
+    min_topics_cited: 1
+    max_latency_seconds: 900
+
+  - id: car_t_lymphoma_candidate
+    description: 62M with relapsed diffuse large B-cell lymphoma evaluating CAR-T
+    intake_payload:
+      primary_specialty: oncology
+      condition_terms:
+        - Diffuse large B-cell lymphoma
+        - Relapsed lymphoma
+      profile:
+        conditions:
+          - DLBCL
+        symptoms:
+          - B symptoms
+        goals:
+          - CAR-T eligibility
+          - Trial options
+    must_mention:
+      - "## 1. What Experts Are Saying"
+      - lymphoma
+      - "## 4. Clinical Trials"
+      - "## 5. Topics to Discuss With Your Specialist"
+    should_not_mention: []
+    min_papers_cited: 1
+    min_trials_cited: 0
+    min_topics_cited: 1
+    max_latency_seconds: 900

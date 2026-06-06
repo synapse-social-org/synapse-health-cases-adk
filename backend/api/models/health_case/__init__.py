@@ -56,6 +56,10 @@ class HealthCaseDigestStatus:
 class HealthCaseProfile(EmbeddedDocument):
     """User-reviewed medical context derived from records and manual entry."""
 
+    # Structured demographics ({"sex": "...", "age": ...}). Sex drives selection
+    # of the correct sex-specific Quest lab reference range; age refines
+    # age-banded references (e.g. DHEA-S, IGF-1).
+    demographics = DictField(default=dict)
     conditions = ListField(StringField(), default=list)
     symptoms = ListField(StringField(), default=list)
     medications = ListField(StringField(), default=list)
@@ -66,10 +70,22 @@ class HealthCaseProfile(EmbeddedDocument):
     location_preferences = DictField(default=dict)
     questions = ListField(StringField(), default=list)
     notes = StringField()
+    # Research-targeting hypotheses inferred by the intake agent. These are NOT
+    # diagnoses: each entry must cite the explicit ``signals`` it was derived
+    # from so the user (and the brief) can judge it. ``phenotypes`` are
+    # candidate subgroups the patient may belong to; ``organ_age_flags`` are
+    # qualitative organ-age-gap hypotheses (we do not compute a numeric
+    # biological age).
+    phenotypes = ListField(DictField(), default=list)
+    organ_age_flags = ListField(DictField(), default=list)
+    # Canonical conditions normalized via the structured clinical dictionary
+    # (ICD-10, organ axes, optional severity grade when explicitly supported).
+    structured_conditions = ListField(DictField(), default=list)
     updated_at = DateTimeField()
 
     def to_dict(self) -> dict:
         return {
+            "demographics": self.demographics or {},
             "conditions": self.conditions or [],
             "symptoms": self.symptoms or [],
             "medications": self.medications or [],
@@ -80,6 +96,9 @@ class HealthCaseProfile(EmbeddedDocument):
             "location_preferences": self.location_preferences or {},
             "questions": self.questions or [],
             "notes": self.notes or "",
+            "phenotypes": self.phenotypes or [],
+            "organ_age_flags": self.organ_age_flags or [],
+            "structured_conditions": self.structured_conditions or [],
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
@@ -87,7 +106,7 @@ class HealthCaseProfile(EmbeddedDocument):
 class HealthCase(Document):
     user_id = ObjectIdField(required=True)
     title = StringField(required=True, max_length=160)
-    primary_specialty = StringField(default="cardiology")
+    primary_specialty = StringField(default="")
     condition_terms = ListField(StringField(), default=list)
     status = StringField(default=HealthCaseStatus.DRAFT)
     profile = EmbeddedDocumentField(HealthCaseProfile, default=HealthCaseProfile)

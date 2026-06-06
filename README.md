@@ -82,10 +82,20 @@ without garbling the client (the `adk_yielded` flag pattern — see the route).
 
 ```
 backend/
-  services/health_cases_adk.py       # ADK Runner, tool wrappers, intake & brief streaming
-  api/routes/health_case/__init__.py # Flask SSE routes + ADK/legacy fallback wiring
-  api/models/health_case/__init__.py # MongoEngine model for Health Cases
-  tests/test_health_cases_adk.py     # Unit tests for the ADK path
+  services/health_cases_adk.py        # ADK Runner, tool wrappers, intake & brief streaming
+  services/mcp_health_case_brief.py    # MCP tool: end-to-end Health Case brief
+  services/mcp_synthesize_evidence.py  # MCP tool: evidence synthesis over retrieved sources
+  services/mcp_web_discourse.py        # MCP tool: Grounding-with-Google-Search web discourse
+  services/mcp/synapse_mcp_server.py   # stdio MCP server consumed by ADK's McpToolset
+  api/routes/health_case/__init__.py   # Flask SSE routes + ADK/legacy fallback wiring
+  api/models/health_case/__init__.py   # MongoEngine model for Health Cases
+  scripts/run_adk_eval.py              # `make adk-eval` scorecard runner
+  scripts/build_adk_eval_set.py        # Builds the ADK-compatible .evalset.json
+  scripts/_adk_prod_intake_smoke.py    # Prod intake smoke check (requires creds)
+  tests/test_health_cases_adk.py       # Unit tests for the ADK path
+  tests/test_adk_eval_set.py           # Eval-set integrity tests
+  tests/health_cases/golden_briefs.yaml         # 4-case golden brief fixtures
+  tests/health_cases/golden_briefs.evalset.json # ADK-compatible eval set
 frontend/
   components/HealthCasesClient.tsx   # React UI consuming the SSE stream
   components/BriefPdfDocument.tsx    # @react-pdf/renderer document
@@ -97,6 +107,7 @@ docs/
 examples/
   67M-mactel-diabetes-ckd-brief.md   # Real captured ADK output
   67M-mactel-diabetes-ckd-brief.pdf  # Same brief, rendered to PDF
+Makefile                             # `make adk-eval` / `adk-eval-validate`
 ```
 
 ## Technology stack

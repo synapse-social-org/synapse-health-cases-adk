@@ -13,11 +13,21 @@ import Button from '@/app/components/Button';
 import PageSkeleton from '@/app/components/PageSkeleton';
 import SplashLogoOrb from '@/app/components/SplashLogoOrb';
 import SynapseIcon from '@/app/components/icons/SynapseIcon';
-import { BookIcon, NetworkIcon, QuoteIcon, SparkleIcon } from '@/app/components/icons';
+import {
+  BookIcon,
+  GoogleIcon,
+  MicrophoneIcon,
+  NetworkIcon,
+  QuoteIcon,
+  SparkleIcon,
+} from '@/app/components/icons';
 import { useShellChrome } from '@/app/components/ShellChromeContext';
+import { useSpeechDictation } from '@/app/hooks/useSpeechDictation';
 import { usePaper } from '@synapse/lib/client';
 import { feedPhraseToId, UserDataSchema } from '@synapse/lib';
 import {
+  BriefProgressMetadata,
+  BriefToolEvent,
   HealthCase,
   HealthCaseCitationGrounding,
   HealthCaseClinicalTrial,
@@ -37,12 +47,15 @@ import {
   useUploadHealthCaseDocument,
 } from '@/app/hooks/useHealthCases';
 import { parseBrief, safeFilename } from './briefPdf';
+import BriefProgress from './BriefProgress';
 import { BriefFinishedActions, briefHasStructuredSections } from './BriefFinishedActions';
 import { MarkdownContent } from '@/app/components/markdown/MarkdownContent';
 import { authFetch } from '@/lib/authUtils';
 import { safeHref } from '@/lib/safeHref';
+import HealthCaseVoiceAgent from './HealthCaseVoiceAgent';
 
 const emptyProfile: HealthCaseProfile = {
+  demographics: {},
   conditions: [],
   symptoms: [],
   medications: [],
@@ -53,6 +66,9 @@ const emptyProfile: HealthCaseProfile = {
   location_preferences: {},
   questions: [],
   notes: '',
+  phenotypes: [],
+  organ_age_flags: [],
+  structured_conditions: [],
 };
 
 function splitLines(value: string): string[] {
@@ -839,12 +855,58 @@ type IntakeMessage = {
   attachments?: string[];
 };
 
-const initialIntakeMessage: IntakeMessage = {
-  id: 'assistant-initial',
-  role: 'assistant',
-  content:
-    "Let's build the Health Case together. Tell me who this is for, what has happened so far, and what decision you're trying to make. Attach any records — labs, imaging reports, discharge summaries — whenever they help.",
-};
+const HEALTH_CASE_INTAKE_ANIMATED_QUERIES = [
+  'Recent HFpEF diagnosis with worsening shortness of breath — what therapies and trials matter?',
+  'Second opinion on atrial fibrillation treatment options with every claim cited',
+  'Summarize labs, imaging reports, current meds, and unanswered clinical questions',
+  'Find relevant researchers, expert perspectives, and active clinical trials near me',
+];
+
+const INTAKE_TYPE_SPEED = 55;
+const INTAKE_DELETE_SPEED = 25;
+const INTAKE_PAUSE_AFTER_TYPE = 2200;
+const INTAKE_PAUSE_AFTER_DELETE = 400;
+
+const INTAKE_PROGRESS_PHRASES = [
+  'Analyzing your input',
+  'Evaluating questions to ask',
+  'Checking attached records',
+  'Structuring the case profile',
+  'Preparing the case summary',
+] as const;
+
+const BRIEF_PROGRESS_PHRASES = [
+  'Planning which sources to consult',
+  'Gathering peer-reviewed evidence',
+  'Checking clinical trials and guidelines',
+  'Synthesizing the cited brief',
+] as const;
+
+const INTAKE_PROGRESS_CYCLE_MS = 2800;
+
+function useCyclingPhrase(
+  phrases: readonly string[],
+  active: boolean,
+  intervalMs = INTAKE_PROGRESS_CYCLE_MS
+): string {
+  const reduceMotion = useReducedMotion();
+  const [index, setIndex] = useState(0);
+
+  useEffect(() => {
+    if (!active || reduceMotion) {
+      setIndex(0);
+      return;
+    }
+    setIndex(0);
+    const id = window.setInterval(() => {
+      setIndex((current) => (current + 1) % phrases.length);
+    }, intervalMs);
+    return () => window.clearInterval(id);
+  }, [active, intervalMs, phrases.length, reduceMotion]);
+
+  if (!active) return phrases[0];
+  return reduceMotion ? phrases[0] : phrases[index % phrases.length];
+}
 
 function formatIntakeAssistantMessage(intake: HealthCaseIntake): string {
   const questions = intake.follow_up_questions || [];
@@ -869,6 +931,9 @@ function ChatComposer({
   acceptFiles = '.pdf,.txt,.md,image/jpeg,image/png,image/webp',
   allowFiles = true,
   disabled = false,
+  animatedQueries,
+  variant = 'default',
+  embedded = false,
 }: {
   draft: string;
   setDraft: (value: string) => void;
@@ -884,94 +949,299 @@ function ChatComposer({
   acceptFiles?: string;
   allowFiles?: boolean;
   disabled?: boolean;
+  animatedQueries?: string[];
+  variant?: 'default' | 'intake';
+  /** Renders inside the chat thread (no outer BorderBeam). */
+  embedded?: boolean;
 }) {
+  const reduceMotion = useReducedMotion();
+  const isIntake = variant === 'intake';
+  const [isFocused, setIsFocused] = useState(false);
+  const [animatedText, setAnimatedText] = useState('');
+  const [isAnimating, setIsAnimating] = useState(
+    () => Boolean(animatedQueries?.length) && !reduceMotion
+  );
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const animationRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queryIndexRef = useRef(0);
+
+  // Voice dictation: finalized speech segments are appended to the draft. We
+  // track the latest draft in a ref so rapid-fire `onresult` callbacks never
+  // drop a segment by closing over a stale value.
+  const draftRef = useRef(draft);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+  const appendTranscript = useCallback(
+    (text: string) => {
+      const previous = draftRef.current;
+      const needsSpace = previous.length > 0 && !/\s$/.test(previous);
+      const next = `${previous}${needsSpace ? ' ' : ''}${text}`;
+      draftRef.current = next;
+      setDraft(next);
+    },
+    [setDraft]
+  );
+  const dictation = useSpeechDictation({ onFinalTranscript: appendTranscript });
+  const voiceDisabled = disabled || isSubmitting;
+  useEffect(() => {
+    if (voiceDisabled && dictation.isListening) dictation.stop();
+  }, [voiceDisabled, dictation.isListening, dictation.stop]);
+
+  const stopAnimation = useCallback(() => {
+    setIsAnimating(false);
+    if (animationRef.current) {
+      clearTimeout(animationRef.current);
+      animationRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!animatedQueries?.length || reduceMotion) {
+      stopAnimation();
+      return;
+    }
+    if (!isAnimating) return;
+
+    let cancelled = false;
+    let currentIndex = queryIndexRef.current;
+
+    const animate = async () => {
+      while (!cancelled) {
+        const targetQuery = animatedQueries[currentIndex % animatedQueries.length];
+
+        for (let i = 0; i <= targetQuery.length; i++) {
+          if (cancelled) return;
+          setAnimatedText(targetQuery.slice(0, i));
+          await new Promise<void>((resolve) => {
+            animationRef.current = setTimeout(resolve, INTAKE_TYPE_SPEED);
+          });
+        }
+
+        if (cancelled) return;
+        await new Promise<void>((resolve) => {
+          animationRef.current = setTimeout(resolve, INTAKE_PAUSE_AFTER_TYPE);
+        });
+
+        for (let i = targetQuery.length; i >= 0; i--) {
+          if (cancelled) return;
+          setAnimatedText(targetQuery.slice(0, i));
+          await new Promise<void>((resolve) => {
+            animationRef.current = setTimeout(resolve, INTAKE_DELETE_SPEED);
+          });
+        }
+
+        if (cancelled) return;
+        await new Promise<void>((resolve) => {
+          animationRef.current = setTimeout(resolve, INTAKE_PAUSE_AFTER_DELETE);
+        });
+
+        currentIndex++;
+        queryIndexRef.current = currentIndex;
+      }
+    };
+
+    animate();
+
+    return () => {
+      cancelled = true;
+      if (animationRef.current) clearTimeout(animationRef.current);
+    };
+  }, [animatedQueries, isAnimating, reduceMotion, stopAnimation]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, isIntake ? 160 : 120)}px`;
+  }, [draft, isIntake]);
+
   const canSubmit = !disabled && !isSubmitting && (draft.trim().length > 0 || files.length > 0);
+  const showAnimatedPlaceholder =
+    Boolean(animatedQueries?.length) && !isFocused && !draft.trim() && isAnimating && !files.length;
 
   const handleSubmit = (event: React.FormEvent) => {
     event.preventDefault();
+    if (dictation.isListening) dictation.stop();
     if (!canSubmit) return;
     onSubmit();
   };
 
-  return (
-    <BorderBeam size="md" duration={8} colorVariant="ocean" theme="auto" className="w-full">
-      <form
-        onSubmit={handleSubmit}
-        className="rounded-[30px] bg-white/95 p-3 shadow-[0_18px_70px_rgba(2,24,44,0.1)] backdrop-blur-xl dark:bg-neutral-950/95"
-      >
-        <div className="flex items-start gap-3">
+  const formShell = (
+    <form
+      onSubmit={handleSubmit}
+      className={`bg-white/95 backdrop-blur-xl dark:bg-neutral-950/95 ${
+        embedded
+          ? 'rounded-2xl p-2.5 ring-0'
+          : `rounded-[30px] ${
+              isIntake
+                ? 'p-4 shadow-[0_24px_90px_rgba(2,24,44,0.14)] ring-1 ring-sky-200/60 dark:ring-sky-500/20'
+                : 'p-3 shadow-[0_18px_70px_rgba(2,24,44,0.1)]'
+            }`
+      }`}
+    >
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+        <div className="relative min-w-0 flex-1">
+          {showAnimatedPlaceholder && (
+            <div
+              className="pointer-events-none absolute inset-0 z-[1] rounded-2xl px-4 py-3.5 md:py-4"
+              aria-hidden
+            >
+              <span
+                className={`text-neutral-400 dark:text-neutral-500 ${
+                  isIntake ? 'text-[15px] leading-6 md:text-base' : 'text-sm'
+                }`}
+              >
+                {animatedText}
+                <span className="ml-0.5 inline-block h-5 w-0.5 animate-pulse bg-neutral-400 align-middle dark:bg-neutral-500" />
+              </span>
+            </div>
+          )}
           <textarea
+            ref={textareaRef}
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={(event) => {
+              setDraft(event.target.value);
+              if (isAnimating) stopAnimation();
+            }}
+            onFocus={() => {
+              setIsFocused(true);
+              stopAnimation();
+              setAnimatedText('');
+            }}
+            onBlur={() => {
+              setIsFocused(false);
+              if (!draft.trim() && animatedQueries?.length && !reduceMotion) {
+                setIsAnimating(true);
+              }
+            }}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault();
                 if (canSubmit) onSubmit();
               }
             }}
-            placeholder={placeholder}
-            className="min-h-16 flex-1 cursor-text resize-none rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-sm text-neutral-900 outline-none transition placeholder:text-neutral-400 focus:border-sky-400 focus:bg-white focus:ring-2 focus:ring-sky-100 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white dark:placeholder:text-neutral-500 dark:focus:border-sky-500 dark:focus:ring-sky-950"
+            placeholder={showAnimatedPlaceholder ? '' : placeholder}
+            className={`relative z-[2] w-full min-w-0 cursor-text resize-none rounded-2xl border border-neutral-200 bg-neutral-50 text-neutral-900 outline-none transition placeholder:text-neutral-400 focus:border-sky-400 focus:bg-white focus:ring-4 focus:ring-sky-100/80 dark:border-neutral-700 dark:bg-neutral-900 dark:text-white dark:placeholder:text-neutral-500 dark:focus:border-sky-500 dark:focus:ring-sky-950/60 ${
+              isIntake
+                ? 'min-h-[88px] px-4 py-3.5 text-[15px] leading-6 md:min-h-[96px] md:py-4 md:text-base'
+                : 'min-h-16 px-4 py-3 text-sm focus:ring-2'
+            }`}
             data-posthog-mask
             aria-label="Message"
           />
-          <Button type="submit" className="mt-1 h-11 min-w-24 rounded-2xl" disabled={!canSubmit}>
+        </div>
+        <div className="flex w-full items-center gap-2 sm:mt-1 sm:w-auto">
+          {dictation.isSupported && (
+            <button
+              type="button"
+              onClick={() => dictation.toggle()}
+              disabled={voiceDisabled}
+              aria-pressed={dictation.isListening}
+              aria-label={dictation.isListening ? 'Stop voice input' : 'Start voice input'}
+              title={dictation.isListening ? 'Stop voice input' : 'Dictate with your voice'}
+              className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                isIntake ? 'md:h-12 md:w-12' : ''
+              } ${
+                dictation.isListening
+                  ? 'border-red-300 bg-red-50 text-red-600 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300'
+                  : 'border-neutral-200 bg-white text-neutral-600 hover:border-sky-300 hover:text-sky-700 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 dark:hover:border-sky-800 dark:hover:text-sky-300'
+              }`}
+            >
+              <MicrophoneIcon
+                className={`h-5 w-5 ${dictation.isListening ? 'motion-safe:animate-pulse' : ''}`}
+                isFilled={dictation.isListening}
+              />
+            </button>
+          )}
+          <Button
+            type="submit"
+            className={`h-11 flex-1 rounded-2xl sm:w-auto ${
+              isIntake ? 'sm:min-w-28 md:h-12' : 'sm:min-w-24'
+            }`}
+            disabled={!canSubmit}
+          >
             {isSubmitting ? pendingLabel : submitLabel}
           </Button>
         </div>
+      </div>
 
-        {files.length > 0 && (
-          <div className="mt-3 flex flex-wrap gap-2 border-t border-neutral-100 pt-3 dark:border-neutral-800">
-            {files.map((file) => (
-              <button
-                key={`${file.name}-${file.size}-${file.lastModified}`}
-                type="button"
-                onClick={() => onRemoveFile(file)}
-                className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1.5 text-xs text-neutral-700 transition hover:border-red-200 hover:text-red-600 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-200"
-                title="Remove file"
-                data-posthog-mask
-              >
-                {file.name} · {formatFileSize(file.size)} · remove
-              </button>
-            ))}
-          </div>
-        )}
-
-        <div className="mt-3 flex flex-col gap-3 border-t border-neutral-100 pt-3 dark:border-neutral-800 sm:flex-row sm:items-center sm:justify-between">
-          {allowFiles ? (
-            <label className="inline-flex w-fit cursor-pointer items-center justify-center rounded-xl border border-neutral-200 bg-white px-4 py-2 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800">
-              Attach records
-              <input
-                type="file"
-                multiple
-                accept={acceptFiles}
-                className="sr-only"
-                onChange={(event) => {
-                  const selected = Array.from(event.target.files || []);
-                  onAddFiles(selected);
-                  event.target.value = '';
-                }}
-              />
-            </label>
-          ) : (
-            <span />
-          )}
-          <p className="text-xs text-neutral-500 dark:text-neutral-400">
-            {helperText ?? 'Press Enter to send · Shift + Enter for a new line'}
-          </p>
+      {files.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-2 border-t border-neutral-100 pt-3 dark:border-neutral-800">
+          {files.map((file) => (
+            <button
+              key={`${file.name}-${file.size}-${file.lastModified}`}
+              type="button"
+              onClick={() => onRemoveFile(file)}
+              className="rounded-full border border-neutral-200 bg-neutral-50 px-3 py-1.5 text-xs text-neutral-700 transition hover:border-red-200 hover:text-red-600 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-200"
+              title="Remove file"
+              data-posthog-mask
+            >
+              {file.name} · {formatFileSize(file.size)} · remove
+            </button>
+          ))}
         </div>
-      </form>
+      )}
+
+      <div className="mt-3 flex flex-col gap-3 border-t border-neutral-100 pt-3 dark:border-neutral-800 sm:flex-row sm:items-center sm:justify-between">
+        {allowFiles ? (
+          <label className="inline-flex w-fit cursor-pointer items-center justify-center rounded-xl border border-neutral-200 bg-white px-4 py-2 text-sm font-medium text-neutral-700 transition hover:bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:bg-neutral-800">
+            Attach records
+            <input
+              type="file"
+              multiple
+              accept={acceptFiles}
+              className="sr-only"
+              onChange={(event) => {
+                const selected = Array.from(event.target.files || []);
+                onAddFiles(selected);
+                event.target.value = '';
+              }}
+            />
+          </label>
+        ) : (
+          <span />
+        )}
+        <p
+          className={`text-xs ${
+            dictation.error
+              ? 'text-red-600 dark:text-red-400'
+              : dictation.isListening
+                ? 'text-red-600 dark:text-red-300'
+                : 'text-neutral-500 dark:text-neutral-400'
+          }`}
+          aria-live="polite"
+          data-posthog-mask
+        >
+          {dictation.error
+            ? dictation.error
+            : dictation.isListening
+              ? dictation.interimTranscript.trim() || 'Listening… tap the mic to stop'
+              : (helperText ?? 'Press Enter to send · Shift + Enter for a new line')}
+        </p>
+      </div>
+    </form>
+  );
+
+  if (embedded) {
+    return <div className="w-full">{formShell}</div>;
+  }
+
+  return (
+    <BorderBeam size="md" duration={8} colorVariant="ocean" theme="auto" className="w-full">
+      {formShell}
     </BorderBeam>
   );
 }
 
-function CreateCaseCard() {
+function CreateCaseCard({ onActiveChange }: { onActiveChange?: (active: boolean) => void }) {
   const router = useRouter();
   const reduceMotion = useReducedMotion();
   const intakeCase = useHealthCaseIntake();
   const createCase = useCreateHealthCase();
   const updateProfile = useUpdateHealthCaseProfile();
   const uploadDocuments = useUploadHealthCaseDocument();
-  const [messages, setMessages] = useState<IntakeMessage[]>([initialIntakeMessage]);
+  const [messages, setMessages] = useState<IntakeMessage[]>([]);
   const [draft, setDraft] = useState('');
   const [files, setFiles] = useState<File[]>([]);
   const [allFiles, setAllFiles] = useState<File[]>([]);
@@ -1110,6 +1380,40 @@ function CreateCaseCard() {
     }
   };
 
+  const showConversation = messages.length > 0 || intakeCase.isPending || Boolean(intake);
+  const intakeProgressPhrase = useCyclingPhrase(INTAKE_PROGRESS_PHRASES, intakeCase.isPending);
+
+  // Once the conversation starts, the dashboard collapses its marketing
+  // sections so the chat takes over the full page (Perplexity-style).
+  useEffect(() => {
+    onActiveChange?.(showConversation);
+  }, [showConversation, onActiveChange]);
+
+  const intakeComposer = (
+    <ChatComposer
+      variant="intake"
+      embedded={showConversation}
+      draft={draft}
+      setDraft={setDraft}
+      onSubmit={submitTurn}
+      files={files}
+      onAddFiles={(selected) => {
+        setFiles((current) => [...current, ...selected]);
+        setIntake(null);
+      }}
+      onRemoveFile={removeFile}
+      isSubmitting={intakeCase.isPending}
+      pendingLabel={intakeCase.isPending ? intakeProgressPhrase : 'Send'}
+      submitLabel="Send"
+      animatedQueries={showConversation || intake ? undefined : HEALTH_CASE_INTAKE_ANIMATED_QUERIES}
+      placeholder={
+        intake
+          ? 'Reply yes to confirm, or add more context to refine the summary'
+          : "Describe your health case — who's it for, what's happened, and what you're deciding"
+      }
+    />
+  );
+
   return (
     <BorderBeam size="md" duration={9} colorVariant="ocean" theme="auto" className="w-full">
       <motion.section
@@ -1118,108 +1422,158 @@ function CreateCaseCard() {
         animate={{ opacity: 1, y: 0, scale: 1 }}
         transition={{ type: 'spring', stiffness: 360, damping: 34 }}
       >
-        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(78,157,252,0.16),transparent_28rem),radial-gradient(circle_at_80%_10%,rgba(129,140,248,0.12),transparent_24rem)]" />
-        <div className="relative border-b border-black/5 px-5 py-5 dark:border-white/[0.07] md:px-8 md:py-6">
-          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
-            <div>
-              <div className="flex items-center gap-3">
-                <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--accent-light)] text-[var(--accent)]">
-                  <SynapseIcon className="h-5 w-5" isFilled />
-                </div>
-                <div>
-                  <p className="text-sm font-semibold text-sky-700 dark:text-sky-300">
-                    Synapse intake
-                  </p>
-                  <h2 className="text-2xl font-bold tracking-tight text-neutral-950 dark:text-white md:text-3xl">
-                    Chat through the case.
-                  </h2>
-                </div>
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(78,157,252,0.18),transparent_28rem),radial-gradient(circle_at_80%_10%,rgba(129,140,248,0.14),transparent_24rem)]" />
+        <div className="relative px-5 pt-5 md:px-8 md:pt-7">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-[var(--accent-light)] text-[var(--accent)] shadow-sm">
+                <SynapseIcon className="h-5 w-5" isFilled />
               </div>
-              <p className="mt-3 max-w-2xl text-sm leading-6 text-neutral-600 dark:text-neutral-300">
-                Tell us about the case in plain English. Attach records when they help. When the
-                summary looks right, just reply &ldquo;yes&rdquo; and we&rsquo;ll generate the
-                Expert Research brief.
-              </p>
+              <div>
+                <p className="text-sm font-semibold text-sky-700 dark:text-sky-300">
+                  Synapse Intake Agent
+                </p>
+                <h2 className="text-2xl font-bold tracking-tight text-neutral-950 dark:text-white md:text-3xl">
+                  Chat through the case.
+                </h2>
+              </div>
             </div>
-            <div className="rounded-2xl border border-white/70 bg-white/55 px-4 py-3 text-xs text-neutral-600 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-neutral-300">
+            <div className="rounded-2xl border border-white/70 bg-white/55 px-4 py-2.5 text-xs text-neutral-600 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04] dark:text-neutral-300 sm:max-w-[220px]">
               Private intake · PDF-aware · confirm before saving
             </div>
           </div>
+
+          {!showConversation && (
+            <div className="mt-5 space-y-4 md:mt-6">
+              <HealthCaseVoiceAgent />
+              {intakeComposer}
+            </div>
+          )}
         </div>
 
-        <div className="relative space-y-5 p-4 md:p-6 lg:p-8">
-          <div
-            ref={messagesContainerRef}
-            className="max-h-[520px] min-h-[150px] space-y-5 overflow-y-auto rounded-[30px] border border-white/70 bg-white/45 p-4 pr-2 shadow-inner dark:border-white/[0.06] dark:bg-black/10 md:p-6"
-          >
-            {messages.map((message) => (
-              <ChatBubble
-                key={message.id}
-                role={message.role}
-                content={message.content}
-                attachments={message.attachments}
-              />
-            ))}
-            {intakeCase.isPending && <ChatTypingBubble label="Reading the case and records" />}
-            {intake && !intakeCase.isPending && (
-              <ChatBubble role="assistant" inline>
-                <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 p-4 text-sm text-emerald-950 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100">
-                  <p className="font-semibold">Ready to create the Health Case?</p>
-                  <p className="mt-2" data-posthog-mask>
-                    Reply <span className="font-mono">yes</span> to save this intake and start
-                    Expert Research, or keep chatting and I&rsquo;ll update the summary before
-                    anything is saved.
-                  </p>
-                  {intake.records_read.length > 0 && (
-                    <div className="mt-3 border-t border-emerald-200 pt-3 dark:border-emerald-900">
-                      <p className="font-medium">Records read:</p>
-                      <div className="mt-2 flex flex-wrap gap-2">
-                        {intake.records_read.map((record) => (
-                          <span
-                            key={`${record.filename}-${record.status}`}
-                            className="rounded-full bg-white/70 px-3 py-1 text-xs dark:bg-neutral-900/70"
-                            data-posthog-mask
-                          >
-                            {record.filename} · {record.status}
-                            {record.word_count ? ` · ${record.word_count} words` : ''}
-                          </span>
-                        ))}
-                      </div>
+        <div className="relative space-y-5 px-4 pb-4 pt-5 md:px-6 md:pb-6 md:pt-6 lg:px-8 lg:pb-8">
+          {showConversation && (
+            <div className="flex h-[calc(100svh-14rem)] min-h-[380px] flex-col overflow-hidden rounded-[30px] border border-white/70 bg-white/45 shadow-inner md:h-[calc(100svh-13rem)] dark:border-white/[0.06] dark:bg-black/10">
+              <div
+                ref={messagesContainerRef}
+                className="min-h-[120px] flex-1 space-y-5 overflow-y-auto p-4 pr-2 md:p-6"
+              >
+                {messages.map((message) => (
+                  <ChatBubble
+                    key={message.id}
+                    role={message.role}
+                    content={message.content}
+                    attachments={message.attachments}
+                  />
+                ))}
+                {intakeCase.isPending && (
+                  <IntakeProgressBubble
+                    label={intakeProgressPhrase}
+                    hasRecords={allFiles.length > 0 || files.length > 0}
+                  />
+                )}
+                {intake && !intakeCase.isPending && (
+                  <ChatBubble role="assistant" inline>
+                    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/80 p-4 text-sm text-emerald-950 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-100">
+                      <p className="font-semibold">Ready to create the Health Case?</p>
+                      <p className="mt-2" data-posthog-mask>
+                        Reply <span className="font-mono">yes</span> to save this intake and start
+                        Expert Research, or keep chatting and I&rsquo;ll update the summary before
+                        anything is saved.
+                      </p>
+                      {intake.records_read.length > 0 && (
+                        <div className="mt-3 border-t border-emerald-200 pt-3 dark:border-emerald-900">
+                          <p className="font-medium">Records read:</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {intake.records_read.map((record) => (
+                              <span
+                                key={`${record.filename}-${record.status}`}
+                                className="rounded-full bg-white/70 px-3 py-1 text-xs dark:bg-neutral-900/70"
+                                data-posthog-mask
+                              >
+                                {record.filename} · {record.status}
+                                {record.word_count ? ` · ${record.word_count} words` : ''}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      <Button
+                        className="mt-4"
+                        onClick={() => confirmAndCreate()}
+                        disabled={isSubmitting}
+                      >
+                        {createCase.isPending || uploadDocuments.isPending
+                          ? 'Creating...'
+                          : 'Yes — create Health Case'}
+                      </Button>
                     </div>
-                  )}
-                  <Button
-                    className="mt-4"
-                    onClick={() => confirmAndCreate()}
-                    disabled={isSubmitting}
-                  >
-                    {createCase.isPending || uploadDocuments.isPending
-                      ? 'Creating...'
-                      : 'Yes — create Health Case'}
-                  </Button>
+                  </ChatBubble>
+                )}
+              </div>
+              <div className="shrink-0 border-t border-white/70 bg-white/75 p-3 backdrop-blur-md dark:border-white/[0.06] dark:bg-neutral-950/80 md:p-4">
+                <div className="mb-3">
+                  <HealthCaseVoiceAgent />
                 </div>
-              </ChatBubble>
-            )}
-          </div>
+                {intakeComposer}
+              </div>
+            </div>
+          )}
 
-          <ChatComposer
-            draft={draft}
-            setDraft={setDraft}
-            onSubmit={submitTurn}
-            files={files}
-            onAddFiles={(selected) => {
-              setFiles((current) => [...current, ...selected]);
-              setIntake(null);
-            }}
-            onRemoveFile={removeFile}
-            isSubmitting={intakeCase.isPending}
-            pendingLabel="Reading..."
-            submitLabel={intake ? 'Send' : 'Send'}
-            placeholder={
-              intake
-                ? "Reply 'yes' to confirm, or share more context to refine the summary..."
-                : 'Reply here: diagnosis, symptoms, medications, goals, or answer the follow-up...'
-            }
-          />
+          {!showConversation && (
+            <div className="rounded-[28px] border border-white/70 bg-white/40 p-5 dark:border-white/[0.06] dark:bg-white/[0.03] md:p-6">
+              <p className="max-w-3xl text-sm leading-7 text-neutral-600 dark:text-neutral-300">
+                Let&rsquo;s build the Health Case together. Tell us who this is for, what has
+                happened so far, and what decision you&rsquo;re trying to make. Attach records when
+                they help &mdash; labs, imaging reports, discharge summaries. When the summary looks
+                right, reply &ldquo;yes&rdquo; and we&rsquo;ll generate your Expert Research brief
+                and weekly digest.
+              </p>
+
+              <div className="mt-6 border-t border-black/5 pt-6 dark:border-white/[0.07]">
+                <p className="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">
+                  Clinically grounded intake
+                </p>
+                <p className="mt-1 max-w-2xl text-sm leading-6 text-neutral-600 dark:text-neutral-300">
+                  The questions Synapse asks aren&rsquo;t guesses. They&rsquo;re the same ones a
+                  cardiologist, nephrologist, or hepatologist would ask in a specialist visit
+                  &mdash; brought to you before, between, or without one.
+                </p>
+                <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                  {[
+                    {
+                      title: 'Guideline-anchored questions',
+                      body: 'Each follow-up traces to a current guideline — ACC/AHA, KDIGO, ACOG/ESC — not model intuition. Auditable, not a black box.',
+                    },
+                    {
+                      title: 'Trajectory & organ-system axes',
+                      body: 'We capture how labs change over time and across the heart, kidney, liver, and metabolic axes — structured fields, grounded in your own results.',
+                    },
+                    {
+                      title: 'Sex-specific reference ranges',
+                      body: 'Lab values are read against the correct female or male reference range, so what counts as “normal” is right for you.',
+                    },
+                  ].map((item) => (
+                    <div
+                      key={item.title}
+                      className="rounded-2xl border border-white/70 bg-white/55 p-4 shadow-sm dark:border-white/[0.08] dark:bg-white/[0.04]"
+                    >
+                      <p className="text-sm font-semibold text-neutral-900 dark:text-white">
+                        {item.title}
+                      </p>
+                      <p className="mt-1.5 text-xs leading-5 text-neutral-600 dark:text-neutral-300">
+                        {item.body}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+                <p className="mt-3 text-xs text-neutral-500 dark:text-neutral-400">
+                  This helps you target the right research and prepare for care. It is research
+                  education, not diagnosis or medical advice.
+                </p>
+              </div>
+            </div>
+          )}
 
           {(actionError ||
             intakeCase.error ||
@@ -1235,10 +1589,12 @@ function CreateCaseCard() {
             </p>
           )}
           {uploadProgress && <p className="text-xs text-neutral-500">{uploadProgress}</p>}
-          <p className="text-xs leading-5 text-neutral-500 dark:text-neutral-400">
-            Educational research only — not a diagnosis or medical advice. Records are encrypted and
-            only used for your case.
-          </p>
+          {!showConversation && (
+            <p className="text-xs leading-5 text-neutral-500 dark:text-neutral-400">
+              Educational research only — not a diagnosis or medical advice. Records are encrypted
+              and only used for your case.
+            </p>
+          )}
         </div>
       </motion.section>
     </BorderBeam>
@@ -1275,8 +1631,8 @@ function ChatBubble({
       <div
         className={
           inline
-            ? 'max-w-[88%] flex-1'
-            : `max-w-[88%] rounded-3xl p-4 text-sm shadow-sm ${
+            ? 'min-w-0 max-w-[88%] flex-1 break-words'
+            : `min-w-0 max-w-[88%] break-words rounded-3xl p-4 text-sm shadow-sm ${
                 isAssistant
                   ? 'rounded-tl-md border border-neutral-200 bg-white text-neutral-700 shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-200'
                   : 'rounded-tr-md whitespace-pre-wrap bg-[#02182c] text-white dark:bg-white dark:text-neutral-950'
@@ -1302,15 +1658,73 @@ function ChatBubble({
   );
 }
 
-function ChatTypingBubble({ label }: { label: string }) {
+function GeminiAvatar({ pulsing = false }: { pulsing?: boolean }) {
   return (
-    <div className="flex gap-3">
-      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#02182c] text-white shadow-[0_8px_24px_rgba(2,24,44,0.22)] dark:bg-white dark:text-neutral-950">
-        <SynapseIcon className="h-4 w-4" isFilled />
+    <div
+      className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-white shadow-[0_8px_24px_rgba(2,24,44,0.12)] ring-1 ring-indigo-100 dark:bg-neutral-900 dark:ring-indigo-900/50 ${
+        pulsing ? 'motion-safe:animate-pulse' : ''
+      }`}
+    >
+      <GoogleIcon className="h-5 w-5" aria-hidden />
+    </div>
+  );
+}
+
+function IntakeProgressBubble({ label, hasRecords }: { label: string; hasRecords?: boolean }) {
+  return (
+    <div
+      className="flex gap-3"
+      role="status"
+      aria-busy="true"
+      aria-label="Synapse is processing your intake"
+    >
+      <GeminiAvatar pulsing />
+      <div className="min-w-0 flex-1 rounded-3xl rounded-tl-md border border-indigo-100 bg-gradient-to-br from-white via-indigo-50/80 to-sky-50/60 p-4 text-sm shadow-sm dark:border-indigo-900/40 dark:from-neutral-900 dark:via-indigo-950/30 dark:to-sky-950/20">
+        <p className="font-medium text-neutral-800 dark:text-neutral-100" aria-hidden="true">
+          {label}
+          <AnimatedDots />
+        </p>
+        {hasRecords && (
+          <p className="mt-1.5 text-xs text-neutral-500 dark:text-neutral-400" aria-hidden="true">
+            Extracting and reviewing uploaded records
+          </p>
+        )}
       </div>
+    </div>
+  );
+}
+
+function ChatTypingBubble({
+  label,
+  useGemini = false,
+  detail,
+}: {
+  label: string;
+  useGemini?: boolean;
+  detail?: string;
+}) {
+  return (
+    <div
+      className="flex gap-3"
+      role="status"
+      aria-busy="true"
+      aria-label={detail ? `${label}. ${detail}` : label}
+    >
+      {useGemini ? (
+        <GeminiAvatar pulsing />
+      ) : (
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[#02182c] text-white shadow-[0_8px_24px_rgba(2,24,44,0.22)] dark:bg-white dark:text-neutral-950">
+          <SynapseIcon className="h-4 w-4" isFilled />
+        </div>
+      )}
       <div className="rounded-3xl rounded-tl-md border border-neutral-200 bg-white p-4 text-sm text-neutral-500 shadow-sm dark:border-neutral-800 dark:bg-neutral-900 dark:text-neutral-300">
-        {label}
-        <AnimatedDots />
+        <p aria-hidden="true">
+          {label}
+          <AnimatedDots />
+        </p>
+        {detail && (
+          <p className="mt-1.5 text-xs text-neutral-400 dark:text-neutral-500">{detail}</p>
+        )}
       </div>
     </div>
   );
@@ -1529,14 +1943,23 @@ function CaseListSkeleton() {
 export function HealthCasesDashboard() {
   const { data, isLoading, error } = useHealthCases();
   const reduceMotion = useReducedMotion();
+  const [chatActive, setChatActive] = useState(false);
   useImmersiveSidebar();
 
   return (
-    <div className="synapse-page-bg min-h-screen">
+    <div className="min-h-screen">
       <SidebarRestoreHandle />
-      <main className="mx-auto flex w-full max-w-[1400px] flex-col gap-8 p-4 py-8 md:p-8 lg:py-10">
+      <main
+        className={
+          chatActive
+            ? 'mx-auto flex w-full max-w-4xl flex-col gap-4 px-4 pb-4 pt-4 md:px-8'
+            : 'mx-auto flex w-full max-w-[1400px] flex-col gap-8 p-4 py-8 md:p-8 lg:py-10'
+        }
+      >
         <motion.section
-          className="mx-auto flex w-full max-w-4xl flex-col items-center text-center"
+          className={`mx-auto flex w-full max-w-4xl flex-col items-center text-center ${
+            chatActive ? 'hidden' : ''
+          }`}
           initial={reduceMotion ? false : { opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.5, ease: [0.22, 1, 0.36, 1] }}
@@ -1547,18 +1970,22 @@ export function HealthCasesDashboard() {
             The latest research in your hands.
           </h1>
           <p className="mx-auto mt-4 max-w-2xl text-base leading-7 text-neutral-600 dark:text-neutral-300 md:text-lg">
-            Describe your health case — Synapse returns the latest research, trials, and expert
-            thinking, every claim cited.
+            Describe your health case - Synapse keeps you updated with the latest research, expert
+            perspectives, clinical trials and therapies.
           </p>
         </motion.section>
 
-        <CreateCaseCard />
+        <CreateCaseCard onActiveChange={setChatActive} />
 
-        <HealthCaseValueStrip />
+        <div className={chatActive ? 'hidden' : ''}>
+          <HealthCaseValueStrip />
+        </div>
 
-        <HealthCaseGroundingSection />
+        <div className={chatActive ? 'hidden' : ''}>
+          <HealthCaseGroundingSection />
+        </div>
 
-        <section className="synapse-card rounded-[28px] p-6">
+        <section className={`synapse-card rounded-[28px] p-6 ${chatActive ? 'hidden' : ''}`}>
           <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
@@ -1626,6 +2053,11 @@ type DetailMessage =
       feedSuggestions?: HealthCaseFeedSuggestion[];
       sources?: Array<Record<string, unknown>>;
       citationGrounding?: HealthCaseCitationGrounding | null;
+      toolEvents?: BriefToolEvent[];
+      thinking?: string;
+      activeTool?: string | null;
+      progressMeta?: BriefProgressMetadata | null;
+      startedAtMs?: number | null;
     }
   | {
       kind: 'error';
@@ -1639,6 +2071,13 @@ function buildCaseSummary(healthCase: HealthCase): string {
   lines.push(
     `Here's the **${healthCase.title}** Health Case as I have it. Reply \`yes\` to generate Expert Research, or send any clarifications, follow-up questions, or extra records to refine it first.`
   );
+  const demographics = profile.demographics || {};
+  if (demographics.sex || demographics.age) {
+    const parts: string[] = [];
+    if (demographics.sex) parts.push(String(demographics.sex));
+    if (demographics.age) parts.push(`age ${demographics.age}`);
+    lines.push(`\n**Patient:** ${parts.join(', ')}`);
+  }
   if ((healthCase.condition_terms || []).length > 0) {
     lines.push(`\n**Conditions of interest:** ${healthCase.condition_terms.join(', ')}`);
   }
@@ -1656,6 +2095,34 @@ function buildCaseSummary(healthCase: HealthCase): string {
   }
   if ((profile.questions || []).length > 0) {
     lines.push(`**Questions for Synapse:** ${profile.questions.join(', ')}`);
+  }
+  if ((profile.structured_conditions || []).length > 0) {
+    const structured = (profile.structured_conditions || [])
+      .map((item) => {
+        const icd = (item.icd10_codes || []).join(', ');
+        const grade = item.severity_grade ? ` · ${item.severity_grade}` : '';
+        const icdLabel = icd ? ` (${icd})` : '';
+        return `- ${item.canonical_name}${icdLabel}${grade}`;
+      })
+      .join('\n');
+    lines.push(
+      `\n**Structured conditions** (dictionary normalization, not a diagnosis):\n${structured}`
+    );
+  }
+  if ((profile.phenotypes || []).length > 0) {
+    const subgroups = (profile.phenotypes || [])
+      .map((item) => {
+        const confidence = item.confidence ? ` _(${item.confidence} confidence)_` : '';
+        return `- ${item.label}${confidence}`;
+      })
+      .join('\n');
+    lines.push(`\n**Likely subgroups** (hypotheses for research, not a diagnosis):\n${subgroups}`);
+  }
+  if ((profile.organ_age_flags || []).length > 0) {
+    const flags = (profile.organ_age_flags || [])
+      .map((item) => `- ${item.organ}: appears older than chronological age`)
+      .join('\n');
+    lines.push(`\n**Organ-age signals** (hypotheses for research, not a diagnosis):\n${flags}`);
   }
   return lines.join('\n');
 }
@@ -1806,10 +2273,31 @@ function ProfileEditorInline({
   const [goals, setGoals] = useState(joinLines(initial.goals));
   const [questions, setQuestions] = useState(joinLines(initial.questions));
   const [notes, setNotes] = useState(initial.notes || '');
+  // Sex drives selection of the correct sex-specific lab reference range, so it
+  // is editable here; age refines age-banded references.
+  const [sex, setSex] = useState(initial.demographics?.sex || '');
+  const [age, setAge] = useState(
+    initial.demographics?.age != null ? String(initial.demographics.age) : ''
+  );
+  // Structured hypotheses are not free-text editable here; the user can keep or
+  // remove them. They must be preserved on save or the spread of `emptyProfile`
+  // (which has empty arrays) would wipe the intake-detected subgroups.
+  const [phenotypes, setPhenotypes] = useState(initial.phenotypes || []);
+  const [organAgeFlags, setOrganAgeFlags] = useState(initial.organ_age_flags || []);
+  const [structuredConditions, setStructuredConditions] = useState(
+    initial.structured_conditions || []
+  );
 
   const save = async () => {
+    const demographics: HealthCaseProfile['demographics'] = {};
+    if (sex.trim()) demographics.sex = sex.trim();
+    const parsedAge = parseInt(age, 10);
+    if (!Number.isNaN(parsedAge) && parsedAge > 0 && parsedAge < 130) {
+      demographics.age = parsedAge;
+    }
     await updateProfile.mutateAsync({
       ...emptyProfile,
+      demographics,
       conditions: splitLines(conditions),
       symptoms: splitLines(symptoms),
       medications: splitLines(medications),
@@ -1817,6 +2305,9 @@ function ProfileEditorInline({
       goals: splitLines(goals),
       questions: splitLines(questions),
       notes,
+      phenotypes,
+      organ_age_flags: organAgeFlags,
+      structured_conditions: structuredConditions,
     });
     onSaved();
   };
@@ -1830,6 +2321,35 @@ function ProfileEditorInline({
       <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
         One item per line. Saving will update the brief next time you generate.
       </p>
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        <label className="block space-y-1.5">
+          <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
+            Sex (for lab reference ranges)
+          </span>
+          <select
+            value={sex}
+            onChange={(event) => setSex(event.target.value)}
+            className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-950"
+          >
+            <option value="">Not specified</option>
+            <option value="female">Female</option>
+            <option value="male">Male</option>
+            <option value="intersex">Intersex</option>
+          </select>
+        </label>
+        <label className="block space-y-1.5">
+          <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">Age</span>
+          <input
+            type="number"
+            min={0}
+            max={129}
+            value={age}
+            onChange={(event) => setAge(event.target.value)}
+            className="w-full rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:border-neutral-800 dark:bg-neutral-950"
+            data-posthog-mask
+          />
+        </label>
+      </div>
       <div className="mt-4 grid gap-3 md:grid-cols-2">
         {[
           ['Conditions', conditions, setConditions],
@@ -1852,6 +2372,120 @@ function ProfileEditorInline({
           </label>
         ))}
       </div>
+      {(structuredConditions.length > 0 || phenotypes.length > 0 || organAgeFlags.length > 0) && (
+        <div className="mt-4 space-y-3">
+          <div>
+            <p className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
+              Structured conditions, subgroups &amp; organ-age signals
+            </p>
+            <p className="mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">
+              Dictionary normalization and research hypotheses — not a diagnosis. Remove any that
+              don&rsquo;t fit.
+            </p>
+          </div>
+          <div className="flex flex-col gap-2">
+            {structuredConditions.map((item, index) => (
+              <div
+                key={`structured-${index}`}
+                className="flex items-start justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-950"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-neutral-900 dark:text-white">
+                    {item.canonical_name}
+                    {(item.icd10_codes || []).length > 0 ? (
+                      <span className="ml-1 text-xs font-normal text-neutral-500 dark:text-neutral-400">
+                        ({(item.icd10_codes || []).join(', ')})
+                      </span>
+                    ) : null}
+                  </p>
+                  {item.severity_grade ? (
+                    <p className="mt-0.5 text-xs text-neutral-600 dark:text-neutral-300">
+                      Grade: {item.severity_grade}
+                    </p>
+                  ) : null}
+                  {(item.signals || []).length > 0 ? (
+                    <p className="mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">
+                      Based on: {(item.signals || []).join('; ')}
+                    </p>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setStructuredConditions((prev) => prev.filter((_, i) => i !== index))
+                  }
+                  className="shrink-0 text-xs font-medium text-neutral-500 hover:text-red-600"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            {phenotypes.map((item, index) => (
+              <div
+                key={`phenotype-${index}`}
+                className="flex items-start justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-950"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-neutral-900 dark:text-white">
+                    {item.label}
+                    {item.confidence ? (
+                      <span className="ml-1 text-xs font-normal text-neutral-500 dark:text-neutral-400">
+                        ({item.confidence} confidence)
+                      </span>
+                    ) : null}
+                  </p>
+                  {item.rationale ? (
+                    <p className="mt-0.5 text-xs text-neutral-600 dark:text-neutral-300">
+                      {item.rationale}
+                    </p>
+                  ) : null}
+                  {(item.signals || []).length > 0 ? (
+                    <p className="mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">
+                      Based on: {(item.signals || []).join('; ')}
+                    </p>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPhenotypes((prev) => prev.filter((_, i) => i !== index))}
+                  className="shrink-0 text-xs font-medium text-neutral-500 hover:text-red-600"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+            {organAgeFlags.map((item, index) => (
+              <div
+                key={`organ-age-${index}`}
+                className="flex items-start justify-between gap-3 rounded-xl border border-neutral-200 bg-white px-3 py-2 dark:border-neutral-800 dark:bg-neutral-950"
+              >
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-neutral-900 dark:text-white">
+                    {item.organ}: appears older than chronological age
+                  </p>
+                  {item.rationale ? (
+                    <p className="mt-0.5 text-xs text-neutral-600 dark:text-neutral-300">
+                      {item.rationale}
+                    </p>
+                  ) : null}
+                  {(item.signals || []).length > 0 ? (
+                    <p className="mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">
+                      Based on: {(item.signals || []).join('; ')}
+                    </p>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setOrganAgeFlags((prev) => prev.filter((_, i) => i !== index))}
+                  className="shrink-0 text-xs font-medium text-neutral-500 hover:text-red-600"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <label className="mt-3 block space-y-1.5">
         <span className="text-xs font-medium text-neutral-700 dark:text-neutral-300">
           Additional notes
@@ -2060,6 +2694,11 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
               ...message,
               content: brief.content,
               isStreaming: brief.isStreaming,
+              toolEvents: brief.toolEvents,
+              thinking: brief.thinking,
+              activeTool: brief.activeTool,
+              progressMeta: brief.progressMeta,
+              startedAtMs: brief.startedAtMs,
               researchers: brief.savedBrief?.researchers || message.researchers,
               clinicalTrials: brief.savedBrief?.clinical_trials || message.clinicalTrials,
               feedSuggestions: brief.savedBrief?.feed_suggestions || message.feedSuggestions,
@@ -2070,7 +2709,17 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
           : message
       )
     );
-  }, [activeBriefMessageId, brief.content, brief.isStreaming, brief.savedBrief]);
+  }, [
+    activeBriefMessageId,
+    brief.content,
+    brief.isStreaming,
+    brief.savedBrief,
+    brief.toolEvents,
+    brief.thinking,
+    brief.activeTool,
+    brief.progressMeta,
+    brief.startedAtMs,
+  ]);
 
   // When the brief stream ends, refetch case to pick up status + saved brief.
   useEffect(() => {
@@ -2101,6 +2750,16 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
     if (brief.isStreaming) return false;
     return ['profile_confirmed', 'ready', 'failed'].includes(data.status);
   }, [data, brief.isStreaming]);
+
+  const briefProgressPhrase = useCyclingPhrase(
+    BRIEF_PROGRESS_PHRASES,
+    brief.isStreaming && !activeBriefMessageId
+  );
+  const briefPendingLabel = upload.isPending
+    ? 'Uploading...'
+    : brief.isStreaming
+      ? briefProgressPhrase
+      : 'Send';
 
   const startBrief = useCallback(
     async (followUp?: string) => {
@@ -2283,8 +2942,38 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
   if (error) return <p className="p-8 text-sm text-red-600">{error.message}</p>;
   if (!data) return null;
 
+  const detailComposer = (
+    <ChatComposer
+      embedded
+      draft={draft}
+      setDraft={setDraft}
+      onSubmit={submitTurn}
+      files={pendingFiles}
+      onAddFiles={(selected) => setPendingFiles((current) => [...current, ...selected])}
+      onRemoveFile={(file) =>
+        setPendingFiles((current) =>
+          current.filter(
+            (item) =>
+              item.name !== file.name ||
+              item.size !== file.size ||
+              item.lastModified !== file.lastModified
+          )
+        )
+      }
+      isSubmitting={brief.isStreaming || upload.isPending}
+      pendingLabel={briefPendingLabel}
+      submitLabel="Send"
+      placeholder={
+        canGenerate
+          ? 'Reply yes to generate, ask a follow-up, or attach records'
+          : 'Add context, attach records, or wait while we prepare the case'
+      }
+      disabled={brief.isStreaming || upload.isPending}
+    />
+  );
+
   return (
-    <div className="synapse-page-bg min-h-screen">
+    <div className="min-h-screen">
       <SidebarRestoreHandle />
       <main className="mx-auto flex w-full max-w-[1400px] flex-col gap-6 p-4 py-8 md:p-8 lg:py-10">
         <div className="flex items-center justify-between gap-3">
@@ -2381,153 +3070,151 @@ export function HealthCaseDetail({ caseId }: { caseId: string }) {
 
         <DigestSubscribeCard healthCase={data} />
 
+        <HealthCaseVoiceAgent caseId={caseId} />
+
         <BorderBeam size="md" duration={9} colorVariant="ocean" theme="auto" className="w-full">
           <section className="relative overflow-hidden rounded-[36px] synapse-glass-strong">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_20%_0%,rgba(78,157,252,0.16),transparent_28rem),radial-gradient(circle_at_80%_10%,rgba(129,140,248,0.12),transparent_24rem)]" />
 
-            <div className="relative space-y-5 p-4 md:p-6 lg:p-8">
-              <div
-                ref={messagesContainerRef}
-                className="max-h-[640px] min-h-[320px] space-y-5 overflow-y-auto rounded-[30px] border border-white/70 bg-white/45 p-4 pr-2 shadow-inner dark:border-white/[0.06] dark:bg-black/10 md:p-6"
-              >
-                {messages.map((message) => {
-                  if (message.kind === 'text') {
-                    return (
-                      <ChatBubble
-                        key={message.id}
-                        role={message.role}
-                        content={message.content}
-                        attachments={message.attachments}
-                      />
-                    );
-                  }
-                  if (message.kind === 'error') {
+            <div className="relative p-4 md:p-6 lg:p-8">
+              <div className="flex max-h-[min(720px,78vh)] flex-col overflow-hidden rounded-[30px] border border-white/70 bg-white/45 shadow-inner dark:border-white/[0.06] dark:bg-black/10">
+                <div
+                  ref={messagesContainerRef}
+                  className="min-h-[280px] flex-1 space-y-5 overflow-y-auto p-4 pr-2 md:p-6"
+                >
+                  {messages.map((message) => {
+                    if (message.kind === 'text') {
+                      return (
+                        <ChatBubble
+                          key={message.id}
+                          role={message.role}
+                          content={message.content}
+                          attachments={message.attachments}
+                        />
+                      );
+                    }
+                    if (message.kind === 'error') {
+                      return (
+                        <ChatBubble key={message.id} role="assistant" inline>
+                          <div className="rounded-2xl border border-red-200 bg-red-50/80 p-4 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-100">
+                            <p className="font-semibold">Expert Research couldn&rsquo;t finish.</p>
+                            <p className="mt-1" data-posthog-mask>
+                              {message.content}
+                            </p>
+                            <Button
+                              className="mt-3"
+                              disabled={!canGenerate}
+                              onClick={() => startBrief()}
+                            >
+                              Try generating again
+                            </Button>
+                          </div>
+                        </ChatBubble>
+                      );
+                    }
+                    const briefIsComplete =
+                      !message.isStreaming && message.content.trim().length > 0;
                     return (
                       <ChatBubble key={message.id} role="assistant" inline>
-                        <div className="rounded-2xl border border-red-200 bg-red-50/80 p-4 text-sm text-red-900 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-100">
-                          <p className="font-semibold">Expert Research couldn&rsquo;t finish.</p>
-                          <p className="mt-1" data-posthog-mask>
-                            {message.content}
-                          </p>
-                          <Button
-                            className="mt-3"
-                            disabled={!canGenerate}
-                            onClick={() => startBrief()}
-                          >
-                            Try generating again
-                          </Button>
+                        <div className="rounded-3xl rounded-tl-md border border-neutral-200 bg-white p-4 text-sm shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+                          <div className="flex flex-wrap items-center justify-between gap-3">
+                            <p className="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">
+                              Expert Research
+                            </p>
+                            {message.isStreaming ? (
+                              <span className="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 dark:text-indigo-300">
+                                <GoogleIcon className="h-3.5 w-3.5 shrink-0" aria-hidden />
+                                Working
+                                <AnimatedDots />
+                              </span>
+                            ) : briefIsComplete ? (
+                              <DownloadBriefPdfButton
+                                caseTitle={data.title}
+                                conditionTerms={data.condition_terms || []}
+                                briefContent={message.content}
+                                generatedAtIso={message.generatedAtIso}
+                                researchers={message.researchers}
+                                clinicalTrials={message.clinicalTrials}
+                                feedSuggestions={message.feedSuggestions}
+                                variant="outline"
+                                label="Download PDF"
+                              />
+                            ) : null}
+                          </div>
+                          {message.isStreaming && (
+                            <BriefProgress
+                              toolEvents={message.toolEvents || []}
+                              thinking={message.thinking || ''}
+                              activeTool={message.activeTool ?? null}
+                              isStreaming={message.isStreaming}
+                              hasContent={Boolean(message.content)}
+                              startedAtMs={message.startedAtMs ?? null}
+                              progressMeta={message.progressMeta ?? null}
+                            />
+                          )}
+                          {message.content ? (
+                            <>
+                              <ExpertResearchBrief
+                                caseId={data.id}
+                                content={message.content}
+                                researchers={message.researchers}
+                                clinicalTrials={message.clinicalTrials}
+                                feedSuggestions={message.feedSuggestions}
+                                sources={message.sources}
+                                citationGrounding={message.citationGrounding}
+                              />
+                              {briefIsComplete && briefHasStructuredSections(message.content) ? (
+                                <BriefFinishedActions
+                                  caseId={data.id}
+                                  feedSuggestions={message.feedSuggestions}
+                                  conditionTerms={data.condition_terms || []}
+                                />
+                              ) : null}
+                            </>
+                          ) : !message.isStreaming ? (
+                            <BriefGeneratingPlaceholder />
+                          ) : null}
                         </div>
                       </ChatBubble>
                     );
-                  }
-                  const briefIsComplete = !message.isStreaming && message.content.trim().length > 0;
-                  return (
-                    <ChatBubble key={message.id} role="assistant" inline>
-                      <div className="rounded-3xl rounded-tl-md border border-neutral-200 bg-white p-4 text-sm shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
-                          <p className="text-xs font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-300">
-                            Expert Research
-                          </p>
-                          {message.isStreaming ? (
-                            <span className="text-xs text-neutral-500">
-                              streaming
-                              <AnimatedDots />
-                            </span>
-                          ) : briefIsComplete ? (
-                            <DownloadBriefPdfButton
-                              caseTitle={data.title}
-                              conditionTerms={data.condition_terms || []}
-                              briefContent={message.content}
-                              generatedAtIso={message.generatedAtIso}
-                              researchers={message.researchers}
-                              clinicalTrials={message.clinicalTrials}
-                              feedSuggestions={message.feedSuggestions}
-                              variant="outline"
-                              label="Download PDF"
-                            />
-                          ) : null}
-                        </div>
-                        {message.content ? (
-                          <>
-                            <ExpertResearchBrief
-                              caseId={data.id}
-                              content={message.content}
-                              researchers={message.researchers}
-                              clinicalTrials={message.clinicalTrials}
-                              feedSuggestions={message.feedSuggestions}
-                              sources={message.sources}
-                              citationGrounding={message.citationGrounding}
-                            />
-                            {briefIsComplete && briefHasStructuredSections(message.content) ? (
-                              <BriefFinishedActions
-                                caseId={data.id}
-                                feedSuggestions={message.feedSuggestions}
-                                conditionTerms={data.condition_terms || []}
-                              />
-                            ) : null}
-                          </>
-                        ) : (
-                          <BriefGeneratingPlaceholder />
-                        )}
-                      </div>
-                    </ChatBubble>
-                  );
-                })}
-                {brief.isStreaming && !activeBriefMessageId && (
-                  <ChatTypingBubble label="Generating Expert Research" />
-                )}
+                  })}
+                  {brief.isStreaming && !activeBriefMessageId && (
+                    <ChatTypingBubble
+                      useGemini
+                      label={briefProgressPhrase}
+                      detail="Gemini is consulting papers, guidelines, trials, and web sources"
+                    />
+                  )}
+                </div>
+
+                <div className="shrink-0 space-y-3 border-t border-white/70 bg-white/75 p-3 backdrop-blur-md dark:border-white/[0.06] dark:bg-neutral-950/80 md:p-4">
+                  {detailComposer}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      className="rounded-2xl"
+                      disabled={!canGenerate}
+                      onClick={() => startBrief()}
+                    >
+                      {brief.isStreaming ? briefProgressPhrase : 'Generate Expert Research'}
+                    </Button>
+                    {!canGenerate && data.status === 'generating_brief' && (
+                      <span className="text-xs text-neutral-500">
+                        A brief is already running. Hold tight while it finishes.
+                      </span>
+                    )}
+                  </div>
+
+                  {(actionError || brief.error || upload.error || updateProfile.error) && (
+                    <p className="text-sm text-red-600 dark:text-red-400">
+                      {actionError ||
+                        brief.error ||
+                        upload.error?.message ||
+                        updateProfile.error?.message}
+                    </p>
+                  )}
+                </div>
               </div>
-
-              <ChatComposer
-                draft={draft}
-                setDraft={setDraft}
-                onSubmit={submitTurn}
-                files={pendingFiles}
-                onAddFiles={(selected) => setPendingFiles((current) => [...current, ...selected])}
-                onRemoveFile={(file) =>
-                  setPendingFiles((current) =>
-                    current.filter(
-                      (item) =>
-                        item.name !== file.name ||
-                        item.size !== file.size ||
-                        item.lastModified !== file.lastModified
-                    )
-                  )
-                }
-                isSubmitting={brief.isStreaming || upload.isPending}
-                pendingLabel={upload.isPending ? 'Uploading...' : 'Generating...'}
-                submitLabel="Send"
-                placeholder={
-                  canGenerate
-                    ? "Reply 'yes' to generate, ask a follow-up question, or attach more records..."
-                    : 'Add more context, attach records, or wait while the case is being prepared...'
-                }
-                disabled={brief.isStreaming || upload.isPending}
-              />
-
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  className="rounded-2xl"
-                  disabled={!canGenerate}
-                  onClick={() => startBrief()}
-                >
-                  {brief.isStreaming ? 'Generating...' : 'Generate Expert Research'}
-                </Button>
-                {!canGenerate && data.status === 'generating_brief' && (
-                  <span className="text-xs text-neutral-500">
-                    A brief is already running. Hold tight while it finishes.
-                  </span>
-                )}
-              </div>
-
-              {(actionError || brief.error || upload.error || updateProfile.error) && (
-                <p className="text-sm text-red-600 dark:text-red-400">
-                  {actionError ||
-                    brief.error ||
-                    upload.error?.message ||
-                    updateProfile.error?.message}
-                </p>
-              )}
             </div>
           </section>
         </BorderBeam>

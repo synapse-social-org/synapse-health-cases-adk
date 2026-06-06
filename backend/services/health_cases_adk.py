@@ -25,12 +25,26 @@ import sentry_sdk
 logger = logging.getLogger(__name__)
 
 APP_NAME = "synapse_health_case_navigator"
+SYNTHESIS_AGENT_NAME = "health_case_brief_synthesis_agent"
+# The "pro" tier is reserved for the final synthesis pass (quality matters most
+# there). The parallel research fan-out + topics extraction run on the faster
+# "flash" tier so the bulk of the wall-clock — many concurrent tool-calling
+# turns — finishes far quicker. Both are overridable per-environment.
 DEFAULT_MODEL = os.environ.get("HEALTH_CASE_ADK_MODEL", "gemini-3.1-pro-preview")
+# Newest full-flash tier (verified accessible on our key): fast + cheap, yet
+# supports function calling and Google Search grounding, which the research
+# sub-agents require. Pinned (not the moving ``gemini-flash-latest`` alias) so
+# a model rollout can't silently shift production behavior.
+DEFAULT_FAST_MODEL = os.environ.get("HEALTH_CASE_ADK_FAST_MODEL", "gemini-3.5-flash")
 DEFAULT_INTAKE_TIMEOUT_SECONDS = float(
     os.environ.get("HEALTH_CASE_ADK_INTAKE_TIMEOUT_SECONDS", 120)
 )
+# Internal ADK cap is kept strictly below the route's SSE wall-clock ceiling
+# (see ``max_wait_seconds`` in backend/api/routes/health_case/__init__.py) so a
+# timed-out ADK run still leaves runway for the legacy fallback inside the same
+# client connection instead of both racing the same deadline.
 DEFAULT_BRIEF_TIMEOUT_SECONDS = float(
-    os.environ.get("HEALTH_CASE_ADK_BRIEF_TIMEOUT_SECONDS", 450)
+    os.environ.get("HEALTH_CASE_ADK_BRIEF_TIMEOUT_SECONDS", 300)
 )
 
 _GOOGLE_API_KEY_LOCK = threading.Lock()
@@ -42,18 +56,14 @@ class HealthCaseADKUnavailable(RuntimeError):
 
 
 @dataclass
-class HealthCaseADKRunResult:
-    text: str
-    tool_events: list[dict[str, Any]] = field(default_factory=list)
-    feed_suggestion_events: list[dict[str, Any]] = field(default_factory=list)
-    papers_cited: list[dict[str, Any]] = field(default_factory=list)
-    agent_names: list[str] = field(default_factory=list)
-
-
-@dataclass
 class _ToolRunState:
     tool_events: list[dict[str, Any]] = field(default_factory=list)
     papers_cited: list[dict[str, Any]] = field(default_factory=list)
+    # Optional callback invoked the moment a tool finishes, so the brief can
+    # stream ``tool_result`` events live instead of dumping them after the
+    # whole multi-agent run completes. Stays ``None`` for non-streaming callers
+    # (e.g. tests), preserving the original collect-then-return behavior.
+    sink: Callable[[dict[str, Any]], None] | None = None
 
 
 def should_use_adk() -> bool:
@@ -155,6 +165,40 @@ def _import_google_search_tool():
         return google_search
     except Exception:  # pragma: no cover - depends on optional package
         return None
+
+
+def _streaming_run_config():
+    """Return an ADK ``RunConfig`` for token streaming, or ``None``.
+
+    Token streaming lets the synthesis agent's output flow to the client as it
+    is generated. If the installed ADK version doesn't expose it, we degrade to
+    a single end-of-run chunk rather than failing the brief.
+    """
+
+    try:
+        from google.adk.agents.run_config import RunConfig, StreamingMode
+
+        return RunConfig(streaming_mode=StreamingMode.SSE)
+    except Exception:  # pragma: no cover - depends on optional package
+        return None
+
+
+_AGENT_PROGRESS = {
+    "health_case_parallel_research": "Researching in parallel: evidence, trials, researchers, real-time signals...",
+    "evidence_research_agent": "Searching papers, guidelines, and evidence graph...",
+    "clinical_trial_agent": "Looking up relevant clinical trials...",
+    "researcher_match_agent": "Matching relevant researchers and centers...",
+    "web_discourse_agent": "Grounding in real-time discourse via Google Search...",
+    "exa_web_research_agent": "Broadening discovery via Exa web search...",
+    "intervention_topics_agent": "Distilling citation-grounded discussion topics...",
+    SYNTHESIS_AGENT_NAME: "Synthesizing your Expert Research brief...",
+}
+
+
+def _agent_progress_message(author: str | None) -> str | None:
+    if not author:
+        return None
+    return _AGENT_PROGRESS.get(author)
 
 
 def _exa_enabled() -> bool:
@@ -280,7 +324,35 @@ def _run_async(coro, *, timeout_seconds: float | None = None):
     return result[0] if result else None
 
 
-async def _run_agent_text(agent, prompt: str, *, user_id: str, session_id: str) -> str:
+def _event_text(event) -> str:
+    content = getattr(event, "content", None)
+    if content and getattr(content, "parts", None):
+        # Parts may be non-text (function calls, thoughts); guard the access so
+        # a single non-text part can't raise and kill the whole stream.
+        return getattr(content.parts[0], "text", None) or ""
+    return ""
+
+
+async def _run_agent_text(
+    agent,
+    prompt: str,
+    *,
+    user_id: str,
+    session_id: str,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    stream_content: bool = False,
+    content_author: str | None = None,
+    cancel_event: "threading.Event | None" = None,
+) -> str:
+    """Drive an ADK runner to completion and return the final response text.
+
+    When ``on_event`` is provided we also surface live progress: a ``thinking``
+    event as each named agent starts, and — when ``stream_content`` is set —
+    incremental ``content`` deltas from ``content_author`` (the synthesis
+    agent) as they are generated. Callers that omit ``on_event`` get the
+    original collect-then-return behavior unchanged.
+    """
+
     (
         _Agent,
         _ParallelAgent,
@@ -302,13 +374,25 @@ async def _run_agent_text(agent, prompt: str, *, user_id: str, session_id: str) 
         session_service=session_service,
     )
     content = types.Content(role="user", parts=[types.Part(text=prompt)])
+    run_kwargs: dict[str, Any] = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "new_message": content,
+    }
+    run_config = _streaming_run_config() if stream_content else None
+    if run_config is not None:
+        run_kwargs["run_config"] = run_config
+
     final_text: str | None = None
-    event_stream = runner.run_async(
-        user_id=user_id,
-        session_id=session_id,
-        new_message=content,
-    )
+    seen_authors: set[str] = set()
+    streamed_chars = 0
+    event_stream = runner.run_async(**run_kwargs)
     while True:
+        # Cooperative cancellation: if the caller (e.g. a disconnected client)
+        # signalled stop, break at the next event boundary instead of letting
+        # the run burn its full timeout making model calls in an orphan thread.
+        if cancel_event is not None and cancel_event.is_set():
+            break
         try:
             event = await anext(event_stream)
         except StopAsyncIteration:
@@ -327,11 +411,42 @@ async def _run_agent_text(agent, prompt: str, *, user_id: str, session_id: str) 
             )
             break
 
+        author = getattr(event, "author", None)
+        if on_event is not None and author and author not in seen_authors:
+            seen_authors.add(author)
+            message = _agent_progress_message(author)
+            if message:
+                on_event({"type": "thinking", "content": message})
+
+        # Stream synthesis tokens as they arrive. We only forward deltas from
+        # the synthesis agent so the user never sees raw intermediate
+        # sub-agent notes, and we track how much we streamed so the caller can
+        # avoid re-emitting the same text at the end.
+        if (
+            on_event is not None
+            and stream_content
+            and author == content_author
+            and getattr(event, "partial", False)
+        ):
+            delta = _event_text(event)
+            if delta:
+                on_event({"type": "content", "content": delta})
+                streamed_chars += len(delta)
+
         if event.is_final_response() and final_text is None:
             if event.content and event.content.parts:
-                final_text = event.content.parts[0].text or ""
+                final_text = getattr(event.content.parts[0], "text", None) or ""
             elif getattr(event, "actions", None) and event.actions.escalate:
                 final_text = event.error_message or ""
+            # Signal to the caller that the final text was already streamed
+            # token-by-token, so it should not chunk and re-send it.
+            if (
+                on_event is not None
+                and stream_content
+                and streamed_chars > 0
+                and final_text
+            ):
+                on_event({"type": "content_streamed"})
     return final_text or ""
 
 
@@ -366,7 +481,19 @@ def _record_tool_result(state: _ToolRunState, tool: str, result: Any) -> dict[st
             for existing in state.papers_cited
         ):
             state.papers_cited.append(paper)
+    _emit_tool_event(state, event)
     return event["data"] if event.get("error") is None else {"error": event["error"]}
+
+
+def _emit_tool_event(state: _ToolRunState, event: dict[str, Any]) -> None:
+    """Forward a recorded tool event to the live sink, if one is attached."""
+
+    if state.sink is None:
+        return
+    try:
+        state.sink(event)
+    except Exception:  # pragma: no cover - a flaky sink must never break a tool
+        logger.warning("Health Cases tool-event sink raised; dropping event")
 
 
 def _research_tool(
@@ -486,28 +613,28 @@ def _build_health_case_tools(
                 "researchers": researchers,
                 "metadata": graph.get("metadata") or {},
             }
-            state.tool_events.append(
-                {
-                    "type": "tool_result",
-                    "tool": "researcher_match",
-                    "data": data,
-                    "papers": [],
-                    "error": None,
-                }
-            )
+            event = {
+                "type": "tool_result",
+                "tool": "researcher_match",
+                "data": data,
+                "papers": [],
+                "error": None,
+            }
+            state.tool_events.append(event)
+            _emit_tool_event(state, event)
             return data
         except Exception as exc:
             sentry_sdk.capture_exception(exc)
             error = "researcher_match failed"
-            state.tool_events.append(
-                {
-                    "type": "tool_result",
-                    "tool": "researcher_match",
-                    "data": None,
-                    "papers": [],
-                    "error": error,
-                }
-            )
+            event = {
+                "type": "tool_result",
+                "tool": "researcher_match",
+                "data": None,
+                "papers": [],
+                "error": error,
+            }
+            state.tool_events.append(event)
+            _emit_tool_event(state, event)
             return {"error": error}
 
     return [
@@ -692,13 +819,22 @@ def build_health_case_brief_root_agent(
     *,
     model: str,
     tools: list[Any],
+    fast_model: str | None = None,
 ) -> HealthCaseBriefAgents:
-    """Construct the ADK multi-agent graph used for Health Case briefs."""
+    """Construct the ADK multi-agent graph used for Health Case briefs.
+
+    ``model`` (the pro tier) drives only the final synthesis pass. The parallel
+    research sub-agents and the topics extractor run on ``fast_model`` (the
+    flash tier) because that fan-out is the bulk of the wall-clock and is more
+    latency- than reasoning-bound. ``fast_model`` defaults to
+    ``DEFAULT_FAST_MODEL`` when not provided.
+    """
 
     Agent, ParallelAgent, SequentialAgent, *_ = _import_adk_runtime()
+    fast_model = fast_model or DEFAULT_FAST_MODEL
 
     evidence_agent = Agent(
-        model=model,
+        model=fast_model,
         name="evidence_research_agent",
         description="Finds papers, guidelines, consensus, and expert evidence.",
         instruction=(
@@ -721,7 +857,7 @@ def build_health_case_brief_root_agent(
         ]
         trial_tools.append(mcp_toolset)
     trial_agent = Agent(
-        model=model,
+        model=fast_model,
         name="clinical_trial_agent",
         description="Finds relevant ClinicalTrials.gov studies and caveats.",
         instruction=(
@@ -734,7 +870,7 @@ def build_health_case_brief_root_agent(
         output_key="clinical_trial_research",
     )
     researcher_agent = Agent(
-        model=model,
+        model=fast_model,
         name="researcher_match_agent",
         description="Finds relevant researchers, trialists, and centers.",
         instruction=(
@@ -752,7 +888,7 @@ def build_health_case_brief_root_agent(
     web_discourse_agent = None
     if google_search_tool is not None:
         web_discourse_agent = Agent(
-            model=model,
+            model=fast_model,
             name="web_discourse_agent",
             description=(
                 "Grounds the Health Case in real-time public discourse via "
@@ -776,7 +912,7 @@ def build_health_case_brief_root_agent(
             output_key="web_discourse_research",
         )
         parallel_subagents.append(web_discourse_agent)
-    exa_agent = _build_exa_agent(Agent, model)
+    exa_agent = _build_exa_agent(Agent, fast_model)
     if exa_agent is not None:
         parallel_subagents.append(exa_agent)
     parallel_research = ParallelAgent(
@@ -789,7 +925,7 @@ def build_health_case_brief_root_agent(
         ),
     )
     intervention_topics_agent = Agent(
-        model=model,
+        model=fast_model,
         name="intervention_topics_agent",
         description=(
             "Extracts citation-grounded conversation topics a patient can "
@@ -897,49 +1033,148 @@ def stream_health_case_brief_adk(
     prompt: str,
     user_id: str,
     model: str = DEFAULT_MODEL,
+    fast_model: str | None = None,
     timeout_seconds: float = DEFAULT_BRIEF_TIMEOUT_SECONDS,
 ) -> Iterable[dict[str, Any]]:
-    """Run the Health Case Expert Research brief through an ADK team."""
+    """Run the Health Case Expert Research brief through an ADK team.
+
+    Streams events incrementally: agent-progress ``thinking`` events, live
+    ``tool_result`` events as each tool completes, and synthesis ``content``
+    deltas as they are generated. The multi-agent run executes on a daemon
+    thread (Flask routes are sync) while this generator drains a queue, so the
+    client sees movement throughout the run instead of a frozen connection
+    until the very end. A run that fails or times out after streaming partial
+    progress lets the caller persist what was produced.
+    """
 
     if not should_use_adk():
         raise HealthCaseADKUnavailable("HEALTH_CASE_AGENT_BACKEND is not adk")
 
     _ensure_google_api_key()
 
-    state = _ToolRunState()
-    tools = _build_health_case_tools(state)
-    brief_agents = build_health_case_brief_root_agent(model=model, tools=tools)
+    import queue as _queue
 
-    text = _run_async(
-        _run_agent_text(
+    state = _ToolRunState()
+    event_queue: _queue.Queue[tuple[str, Any]] = _queue.Queue()
+    state.sink = lambda event: event_queue.put(("event", event))
+
+    tools = _build_health_case_tools(state)
+    brief_agents = build_health_case_brief_root_agent(
+        model=model, fast_model=fast_model, tools=tools
+    )
+    agent_names = health_case_brief_agent_names(brief_agents.web_discourse_agent)
+    result_holder: dict[str, Any] = {}
+    # Signals the worker to stop at the next event boundary when the consumer
+    # goes away (client disconnect / stall), so we don't leak an orphan thread
+    # making model calls for the rest of the ADK budget.
+    cancel_event = threading.Event()
+
+    async def _drive() -> None:
+        text = await _run_agent_text(
             brief_agents.root_agent,
             prompt,
             user_id=user_id,
             session_id=f"brief_{secrets.token_hex(8)}",
-        ),
-        timeout_seconds=timeout_seconds,
-    )
-    if not text:
+            on_event=lambda event: event_queue.put(("event", event)),
+            stream_content=True,
+            content_author=SYNTHESIS_AGENT_NAME,
+            cancel_event=cancel_event,
+        )
+        result_holder["text"] = text
+
+    def _worker() -> None:
+        try:
+            asyncio.run(asyncio.wait_for(_drive(), timeout=timeout_seconds))
+        except asyncio.TimeoutError:
+            event_queue.put(("error", HealthCaseADKUnavailable("ADK run timed out")))
+        except BaseException as exc:  # noqa: BLE001 - surfaced to the caller
+            event_queue.put(("error", exc))
+        finally:
+            event_queue.put(("done", None))
+
+    worker = threading.Thread(target=_worker, name="health-case-adk", daemon=True)
+    worker.start()
+
+    # Accumulate streamed content so the citation guard always has text to scan
+    # even when the final aggregated event is empty — a health brief must never
+    # reach a user with citation verification silently skipped.
+    streamed_parts: list[str] = []
+    content_streamed = False
+    run_error: BaseException | None = None
+    try:
+        yield {
+            "type": "thinking",
+            "content": "Running Google ADK Health Case Navigator agents...",
+        }
+        # Feed suggestions derive only from the prompt (not the run), so emit
+        # them up front — before any content — preserving the legacy ordering
+        # clients may rely on to pre-render the "track this case" affordance. A
+        # fallback `reset` (see the route) clears them if the ADK attempt
+        # aborts.
+        for event in _feed_suggestions_from_prompt(prompt):
+            yield {"type": "feed_suggestion", **event}
+
+        # If the worker hangs in a non-cancellable call its `finally` never
+        # enqueues ("done"), so cap each wait at the ADK budget plus a small
+        # grace. This detects a stall ~30s after the internal cap instead of
+        # burning the full SSE wall-clock ceiling on the route.
+        stall_timeout = timeout_seconds + 30.0
+
+        while True:
+            try:
+                kind, payload = event_queue.get(timeout=stall_timeout)
+            except _queue.Empty:
+                sentry_sdk.capture_message(
+                    "Health Case ADK run stalled past timeout budget",
+                    level="error",
+                )
+                run_error = HealthCaseADKUnavailable("ADK run stalled")
+                break
+            if kind == "event":
+                event_type = payload.get("type")
+                if event_type == "content_streamed":
+                    # Internal signal: synthesis text already streamed token-by-
+                    # token, so don't re-chunk it below. Not forwarded.
+                    content_streamed = True
+                    continue
+                if event_type == "content":
+                    content_streamed = True
+                    streamed_parts.append(payload.get("content", ""))
+                yield payload
+            elif kind == "error":
+                run_error = payload
+                break
+            elif kind == "done":
+                break
+    finally:
+        # Whether we finish, raise, or the client disconnects (GeneratorExit),
+        # signal the worker to stop and give it a brief chance to unwind.
+        cancel_event.set()
+        worker.join(timeout=2.0)
+
+    if run_error is not None:
+        # Re-raise so the route can decide: if nothing streamed yet it falls
+        # back to the legacy agent; if partial progress already streamed it
+        # persists that and surfaces a retry. Normalize to the sentinel type so
+        # the route's existing `except HealthCaseADKUnavailable` handles it.
+        if isinstance(run_error, HealthCaseADKUnavailable):
+            raise run_error
+        sentry_sdk.capture_exception(run_error)
+        raise HealthCaseADKUnavailable(
+            f"ADK run failed: {type(run_error).__name__}"
+        ) from run_error
+
+    # Prefer the aggregated final text; fall back to the streamed buffer so the
+    # guard (and a chunked re-emit, if needed) always have the brief body.
+    text = result_holder.get("text") or "".join(streamed_parts)
+    if not text and not content_streamed:
         raise HealthCaseADKUnavailable("ADK returned no final response")
 
-    result = HealthCaseADKRunResult(
-        text=text,
-        tool_events=state.tool_events,
-        feed_suggestion_events=_feed_suggestions_from_prompt(prompt),
-        papers_cited=state.papers_cited,
-        agent_names=health_case_brief_agent_names(brief_agents.web_discourse_agent),
-    )
-
-    yield {
-        "type": "thinking",
-        "content": "Running Google ADK Health Case Navigator agents...",
-    }
-    for event in result.tool_events:
-        yield event
-    for event in result.feed_suggestion_events:
-        yield {"type": "feed_suggestion", **event}
-    for chunk in _chunk_text(result.text):
-        yield {"type": "content", "content": chunk}
+    if not content_streamed:
+        # Token streaming was unavailable (older ADK) — emit the final text in
+        # chunks so the client still renders the brief.
+        for chunk in _chunk_text(text):
+            yield {"type": "content", "content": chunk}
 
     # Phase-1 hallucination guard, mirrored from the legacy research-agent
     # path so the production ADK backend also surfaces unverified NCT IDs and
@@ -952,17 +1187,27 @@ def stream_health_case_brief_adk(
             verify_citations,
         )
 
-        if grounding_enabled() and result.text:
-            citation_grounding = verify_citations(result.text, result.papers_cited)
+        if grounding_enabled():
+            if text:
+                citation_grounding = verify_citations(text, state.papers_cited)
+            else:
+                # No text at all to scan (no aggregated final, nothing
+                # streamed). Flag it so clients can distinguish "checked" from
+                # "missed" rather than silently trusting an unverified brief.
+                sentry_sdk.add_breadcrumb(
+                    category="health_case.adk",
+                    message="citation guard skipped: no brief text to scan",
+                    level="warning",
+                )
     except Exception as guard_err:  # pragma: no cover - defensive
         logger.warning("ADK citation grounding skipped: %s", guard_err)
 
     yield {
         "type": "done",
         "metadata": {
-            "papers_cited": result.papers_cited,
+            "papers_cited": state.papers_cited,
             "agent_backend": "google_adk",
-            "adk_agents": result.agent_names,
+            "adk_agents": agent_names,
             # Intentionally None when the guard is disabled or the agent
             # produced no text, so clients distinguish "checked, found
             # nothing" from "didn't check this run".
