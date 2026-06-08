@@ -1,44 +1,54 @@
 graph LR
-  U[User<br/>Next.js Health Cases UI] -->|POST /health-cases| API[Flask API on AWS ECS]
-  API -->|SSE stream| U
-  API -->|Runner.run_async| ADK[Google ADK Orchestrator<br/>SequentialAgent · health_case_navigator]
-  ADK --> Intake[Intake Agent<br/>Gemini · confirm-before-save]
-  ADK --> Research[ParallelAgent<br/>Research stage]
-  Research --> T1[paper_search tool]
-  Research --> T2[researcher_match tool]
-  Research --> T3[clinical_trials_lookup tool<br/>inline fallback]
-  Research --> MCP[MCP clinical_trials_lookup<br/>stdio server · synapse_mcp_server]
-  Research --> Web[web_discourse_agent<br/>Google Search grounding]
-  Research --> Exa[exa_web_research_agent<br/>Exa neural web search]
-  ADK --> Topics[Topics to Discuss<br/>Agent / Gemini<br/>citation-grounded]
-  Topics --> Synth[Synthesis Agent<br/>Gemini]
-  T1 --> OA[(OpenAlex)]
-  T2 --> NPI[(NPI Registry)]
-  T2 --> Mongo[(Synapse Mongo)]
-  T3 --> CT[(ClinicalTrials.gov v2)]
+  U[User<br/>Next.js Health Cases UI]
+  U -->|POST /health-cases/intake| Intake[Intake Agent<br/>health_case_intake_agent<br/>Gemini Pro · confirm-before-save]
+  Intake -->|confirmed profile| U
+  U -->|upload PDF records| S3[(S3 encrypted<br/>case-scoped · not in Mongo profile)]
+  U -->|POST /health-cases/:id/briefs| API[Flask API on AWS ECS]
+  API -->|SSE stream + tool_result events| U
+  API -->|Runner.run_async| Nav[SequentialAgent<br/>health_case_navigator]
+  Nav --> Research[ParallelAgent<br/>Research stage · Gemini Flash]
+  Research --> Evid[evidence_research_agent]
+  Research --> Trial[clinical_trial_agent]
+  Research --> Res[researcher_match_agent]
+  Research --> Web[web_discourse_agent<br/>optional · Google Search grounding]
+  Research --> Exa[exa_web_research_agent<br/>optional · HEALTH_CASE_ENABLE_EXA]
+  Evid --> Tools[paper_search · evidence_lookup · guideline_lookup]
+  Trial --> MCP[McpToolset · clinical_trials_lookup<br/>stdio synapse_mcp_server]
+  Trial --> Inline[inline clinical_trials_lookup<br/>fallback when MCP unavailable]
+  Res --> RM[researcher_match tool]
+  Nav --> Topics[intervention_topics_agent<br/>Gemini Flash · citation-grounded]
+  Topics --> Synth[health_case_brief_synthesis_agent<br/>Gemini Pro · topics verbatim]
+  Tools --> OA[(OpenAlex corpus)]
+  Tools --> KG[(Evidence / Knowledge graph)]
+  RM --> RG[(Synapse researcher graph · Mongo)]
+  Inline --> CT[(ClinicalTrials.gov<br/>synced registry)]
   MCP --> CT
   Web --> GoogleSearch[(Google Search)]
   Exa --> ExaAPI[(Exa API)]
-  Synth --> Guard{Citation Guard<br/>verify_citations<br/>NCT registry check}
-  Guard -->|guarded brief| API
-  Guard -.->|unverified NCTs / acronyms| Banner[/References we could not verify banner/]
+  Synth --> Guard{Citation Guard<br/>verify_citations<br/>NCT + acronym check}
+  Guard -->|guarded brief metadata| API
+  Guard -.->|unverified refs| Banner[/References we could not verify banner/]
   Guard -.->|verify NCT IDs| CT
-  API -.->|subscribe case| Digest[Weekly what's-new digest email<br/>health_case_digest cron · delta builder]
-  Digest -.->|weekly| U
-  API -.timeout / error fallback.-> Legacy[Legacy single-model research agent]
+  API -.->|timeout / error before first token| Legacy[Legacy single-model research agent]
+  API -.->|digest_enabled subscribe| Digest[health_case_digest cron<br/>delta vs prior brief sources]
+  Digest --> CIO[Customer.io<br/>health_case_digest_ready]
+  CIO -.->|weekly email| U
+  API -.->|feed_suggestion| Feed[Launch Research Agent Feed]
   classDef gcp fill:#4285F4,stroke:#1a73e8,color:white
   classDef tool fill:#34A853,stroke:#0f9d58,color:white
   classDef ext fill:#fbbc04,stroke:#f9ab00,color:#333
   classDef api fill:#EA4335,stroke:#c5221f,color:white
+  classDef storage fill:#e8f0fe,stroke:#1a73e8,color:#333
   classDef fallback fill:#9aa0a6,stroke:#5f6368,color:white
   classDef guard fill:#A142F4,stroke:#7627bb,color:white
   classDef warn fill:#fce8e6,stroke:#c5221f,color:#c5221f
   classDef monitor fill:#12B5CB,stroke:#098591,color:white
-  class ADK,Intake,Research,Synth,Topics,Web,Exa gcp
-  class T1,T2,T3,MCP tool
-  class OA,NPI,Mongo,CT,GoogleSearch,ExaAPI ext
+  class Nav,Intake,Research,Synth,Topics,Web,Exa,Evid,Trial,Res gcp
+  class Tools,MCP,Inline,RM tool
+  class OA,KG,RG,CT,GoogleSearch,ExaAPI ext
   class API api
+  class S3 storage
   class Legacy fallback
   class Guard guard
   class Banner warn
-  class Digest monitor
+  class Digest,CIO,Feed monitor
