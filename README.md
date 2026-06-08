@@ -103,7 +103,7 @@ frontend/
   scripts/render-brief-pdf.tsx       # Node-side PDF renderer (re-uses the web component)
 docs/
   google-adk-health-cases-architecture.md
-  architecture.png                   # Source: docs/architecture.mmd (Mermaid)
+  architecture.png                   # Rendered from docs/architecture.mmd (run `make architecture-png`)
 examples/
   67M-mactel-diabetes-ckd-brief.md   # Real captured ADK output
   67M-mactel-diabetes-ckd-brief.pdf  # Same brief, rendered to PDF
@@ -118,7 +118,7 @@ Makefile                             # `make adk-eval` / `adk-eval-validate`
 - **API**: Python 3.11, Flask, Server-Sent Events (SSE)
 - **Web**: Next.js 14, React, @react-pdf/renderer
 - **Hosting**: AWS ECS Fargate (API), Vercel (web)
-- **Data sources**: OpenAlex, PubMed E-utilities, ClinicalTrials.gov v2, NPI Registry, Synapse-owned Mongo corpus
+- **Data sources**: OpenAlex, ClinicalTrials.gov v2 (synced registry), Synapse evidence/knowledge graph, Synapse researcher graph (Mongo), Google Search grounding, Exa (optional)
 - **Observability**: Sentry
 
 ## Reading order for judges

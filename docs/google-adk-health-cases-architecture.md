@@ -13,7 +13,8 @@ The ADK build turns the brief step from a single hand-rolled research-agent
 prompt into a multi-agent workflow:
 
 - `health_case_intake_agent` structures the case story and uploaded record text
-  into a user-confirmed profile.
+  into a user-confirmed profile (separate route — not part of
+  `health_case_navigator`).
 - `evidence_research_agent` retrieves papers, guidelines, consensus, and
   evidence graph context.
 - `clinical_trial_agent` retrieves relevant ClinicalTrials.gov studies.
@@ -26,6 +27,12 @@ prompt into a multi-agent workflow:
   static literature retrieval would miss. If the running ADK version does not
   expose ``google.adk.tools.google_search``, the agent is silently omitted and
   the rest of the workflow proceeds unchanged.
+- `exa_web_research_agent` is an optional fifth parallel sub-agent that broadens
+  discovery via Exa neural web search (guideline pages, society/position
+  statements, regulatory pages, reputable news) that structured databases miss.
+  It is opt-in behind ``HEALTH_CASE_ENABLE_EXA`` (default off) and degrades
+  cleanly when the flag or API key is absent, mirroring the `web_discourse_agent`
+  pattern.
 - `intervention_topics_agent` distills the parallel research outputs into a
   citation-grounded "Topics to Discuss With Your Specialist" block. It NEVER
   recommends treatments or doses; it phrases each bullet as a question or topic
@@ -38,6 +45,8 @@ prompt into a multi-agent workflow:
 
 ## Runtime Flow
 
+See [`architecture.png`](architecture.png) (source: [`architecture.mmd`](architecture.mmd)).
+
 ```mermaid
 flowchart TD
   User["Consumer"] --> Web["/health-cases web UI"]
@@ -46,22 +55,38 @@ flowchart TD
   IntakeAgent --> Profile["Confirmed HealthCaseProfile"]
   Profile --> Brief["POST /health-cases/:id/briefs"]
   Brief --> Workflow["ADK health_case_navigator"]
-  Workflow --> Parallel["ADK ParallelAgent"]
+  Workflow --> Parallel["ADK ParallelAgent · Gemini Flash"]
   Parallel --> Evidence["evidence_research_agent"]
   Parallel --> Trials["clinical_trial_agent"]
   Parallel --> Researchers["researcher_match_agent"]
   Parallel --> WebDiscourse["web_discourse_agent
-  (google_search grounded)"]
+  (optional · google_search grounded)"]
+  Parallel --> Exa["exa_web_research_agent
+  (optional · neural web search)"]
   Evidence --> Tools["Synapse research tools"]
-  Trials --> TrialDB["ClinicalTrial collection"]
+  Trials --> MCP["MCP McpToolset (stdio)
+  clinical_trials_lookup"]
+  MCP --> TrialDB["ClinicalTrial synced registry"]
   Researchers --> AuthorGraph["Researcher graph"]
-  WebDiscourse --> GoogleSearch["Google Search
-  grounding"]
+  WebDiscourse --> GoogleSearch["Google Search grounding"]
+  Exa --> ExaAPI["Exa neural search"]
   Parallel --> Topics["intervention_topics_agent"]
-  Topics --> Synthesis["health_case_brief_synthesis_agent"]
-  Synthesis --> Result["Expert Research brief"]
+  Topics --> Synthesis["health_case_brief_synthesis_agent · Gemini Pro"]
+  Synthesis --> Guard["NCT verification guard
+  (verify_citations)"]
+  Guard --> Result["Expert Research brief"]
   Result --> Cards["Researcher, trial, paper, and feed cards"]
+  Result --> Digest["Weekly per-case digest
+  (Customer.io)"]
 ```
+
+## Model tiering
+
+Parallel research sub-agents and the topics extractor run on the fast Gemini
+Flash tier (`HEALTH_CASE_ADK_FAST_MODEL`, default `gemini-3.5-flash`) because
+that fan-out is tool-calling-heavy and latency-bound. Final synthesis runs on
+the pro tier (`HEALTH_CASE_ADK_MODEL`, default `gemini-3.1-pro-preview`) where
+reasoning quality matters most.
 
 ## Tool Boundary
 
@@ -78,17 +103,48 @@ The adapter records tool outputs and maps them back to the existing SSE event
 shape so `frontend/web/src/app/hooks/useHealthCases.ts` continues to receive
 `content`, `tool_result`, `brief_saved`, `error`, and `done` events.
 
+### MCP boundary
+
+Trial lookup is consumed across the Model Context Protocol boundary. When MCP
+is enabled (`HEALTH_CASE_ENABLE_MCP`, default on), `_build_mcp_toolset()` spawns
+the Synapse MCP server (`services.mcp.synapse_mcp_server`) over stdio and
+exposes it to `clinical_trial_agent` via ADK's `McpToolset` (filtered to
+`clinical_trials_lookup`). Because the MCP server publishes the same function
+name as the inline tool, passing both makes Gemini reject the request with a
+duplicate-declaration error — so the trial agent strips the inline
+`clinical_trials_lookup` and the MCP toolset wins. If the toolset can't be
+built, the agent falls back to the inline function tool rather than failing
+closed.
+
+## Citation Grounding Guard
+
+After synthesis, `verify_citations` (in
+`backend/services/research_agent_extensions.py`) scans the brief for NCT IDs and
+trial acronyms and checks NCT IDs against the Synapse-synced `ClinicalTrial`
+registry collection (a synced mirror of ClinicalTrials.gov). IDs the model
+invented don't resolve and are returned in `unverified_ncts`. The streamed text
+is not mutated; the `done` event carries `citation_grounding` metadata so the
+client can render a "couldn't verify these references" warning rather than
+silently trusting an unverified brief.
+
+## Weekly Per-Case Digest
+
+`backend/cron/health_case_digest.py` assembles a "what's new since your last
+update" email for each Health Case whose owner opted in (`digest_enabled`).
+`build_case_digest` diffs new papers, trials, and discourse against the prior
+brief's source IDs. Delivery routes through Customer.io
+(`health_case_digest_ready` event).
+
 ## Safety And Privacy
 
 - Health Cases routes remain authenticated. Anonymous access is not allowed.
 - Uploaded records are stored under PHI-scoped S3 keys and encrypted at rest.
 - Raw extracted record text is not stored in Mongo summaries.
 - The ADK path preserves existing fallbacks: when `google-adk` is missing or an
-  ADK run fails, the route logs the issue and uses the legacy research agent.
+  ADK run fails before streaming, the route uses the legacy research agent.
 - `HEALTH_CASE_AGENT_BACKEND` defaults to `adk` so the multi-agent workflow is
   the production code path; the legacy executor stays wired in as an automatic
-  fallback. Set `HEALTH_CASE_AGENT_BACKEND=legacy` in an environment to opt
-  back out (e.g. for incident response).
+  fallback.
 
 ## Demo Checklist
 
@@ -99,4 +155,3 @@ shape so `frontend/web/src/app/hooks/useHealthCases.ts` continues to receive
 - Open the clinical trial cards and ClinicalTrials.gov links.
 - Use a researcher `Request Contact` card.
 - Download the PDF brief.
-
